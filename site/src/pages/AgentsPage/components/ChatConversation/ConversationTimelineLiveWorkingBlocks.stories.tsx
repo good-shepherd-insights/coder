@@ -12,6 +12,7 @@ import {
 import {
 	buildStreamRenderState,
 	MockCollapsedStepsPreferences,
+	MockQuestionCallMessage,
 	MockWorkingMessages,
 	pinFixtureClock,
 	workingFixtureTime,
@@ -22,6 +23,11 @@ const meta: Meta<typeof ConversationTimeline> = {
 		"pages/AgentsPage/ChatConversation/ConversationTimeline/LiveWorkingBlocks",
 	component: ConversationTimeline,
 	beforeEach: pinFixtureClock,
+	parameters: {
+		queries: [
+			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
+		],
+	},
 	args: {
 		organizationId: "organization-id",
 		subagentTitles: new Map(),
@@ -45,12 +51,13 @@ const meta: Meta<typeof ConversationTimeline> = {
 export default meta;
 type Story = StoryObj<typeof ConversationTimeline>;
 
+const expandBlock =
+	(name: string): Story["play"] =>
+	async ({ canvasElement }) => {
+		await userEvent.click(within(canvasElement).getByRole("button", { name }));
+	};
+
 export const StreamingFirstStep: Story = {
-	parameters: {
-		queries: [
-			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
-		],
-	},
 	args: {
 		parsedMessages: parseMessagesWithMergedTools(
 			MockWorkingMessages.slice(0, 1),
@@ -65,11 +72,7 @@ export const StreamingFirstStep: Story = {
 			},
 		]),
 	},
-	play: async ({ canvasElement }) => {
-		await userEvent.click(
-			within(canvasElement).getByRole("button", { name: "Working for 12s" }),
-		);
-	},
+	play: expandBlock("Working for 12s"),
 };
 
 const MockBetweenStepsMessages = MockWorkingMessages.slice(0, 4);
@@ -77,11 +80,6 @@ const MockBetweenStepsMessages = MockWorkingMessages.slice(0, 4);
 // Between persisted steps the stream is cleared while a tool runs, so the
 // timeline only knows the turn is active from the chat status.
 export const RunningBetweenSteps: Story = {
-	parameters: {
-		queries: [
-			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
-		],
-	},
 	args: {
 		parsedMessages: parseMessagesWithMergedTools(MockBetweenStepsMessages, {
 			pendingToolCallIDs: getPendingToolCallIDs(
@@ -91,22 +89,13 @@ export const RunningBetweenSteps: Story = {
 		}),
 		liveStatus: { phase: "idle", hasAccumulatedOutput: false },
 	},
-	play: async ({ canvasElement }) => {
-		await userEvent.click(
-			within(canvasElement).getByRole("button", { name: "Working for 12s" }),
-		);
-	},
+	play: expandBlock("Working for 12s"),
 };
 
 // After a tool result the stream reopens empty before the next call streams.
 // That moment is the same block still working, so nothing appears under its
 // summary.
 export const NextStepStartsInsideBlock: Story = {
-	parameters: {
-		queries: [
-			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
-		],
-	},
 	args: {
 		parsedMessages: parseMessagesWithMergedTools(
 			MockWorkingMessages.slice(0, 5),
@@ -115,19 +104,10 @@ export const NextStepStartsInsideBlock: Story = {
 		streamTools: [],
 		liveStatus: { phase: "starting", hasAccumulatedOutput: false },
 	},
-	play: async ({ canvasElement }) => {
-		await userEvent.click(
-			within(canvasElement).getByRole("button", { name: "Working for 12s" }),
-		);
-	},
+	play: expandBlock("Working for 12s"),
 };
 
 export const ReasoningBeforeFirstToolFolds: Story = {
-	parameters: {
-		queries: [
-			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
-		],
-	},
 	args: {
 		parsedMessages: parseMessagesWithMergedTools(
 			MockWorkingMessages.slice(0, 1),
@@ -150,33 +130,12 @@ export const ReasoningBeforeFirstToolFolds: Story = {
 	},
 };
 
-const MockPendingQuestionMessage: ChatMessage = {
-	...MockChatMessage,
-	id: 4,
-	role: "assistant",
-	created_at: workingFixtureTime(5),
-	content: [
-		{
-			type: "tool-call",
-			tool_call_id: "question",
-			tool_name: "ask_user_question",
-			args: {},
-			created_at: workingFixtureTime(5),
-		},
-	],
-};
-
 export const RequiresActionCompletesBlock: Story = {
-	parameters: {
-		queries: [
-			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
-		],
-	},
 	args: {
 		chatStatus: "requires_action",
 		onSendAskUserQuestionResponse: fn(),
 		parsedMessages: parseMessagesWithMergedTools(
-			[...MockWorkingMessages.slice(0, 3), MockPendingQuestionMessage],
+			[...MockWorkingMessages.slice(0, 3), MockQuestionCallMessage],
 			{ pendingToolCallIDs: new Set(["question"]) },
 		),
 	},
@@ -199,11 +158,6 @@ const MockParkedToolMessage: ChatMessage = {
 };
 
 export const RequiresActionKeepsPendingToolVisible: Story = {
-	parameters: {
-		queries: [
-			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
-		],
-	},
 	args: {
 		chatStatus: "requires_action",
 		parsedMessages: parseMessagesWithMergedTools(
@@ -215,11 +169,6 @@ export const RequiresActionKeepsPendingToolVisible: Story = {
 
 // An active turn longer than the loaded page has no prompt row yet.
 export const PromptlessLiveBlock: Story = {
-	parameters: {
-		queries: [
-			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
-		],
-	},
 	args: {
 		hasMoreMessages: true,
 		parsedMessages: parseMessagesWithMergedTools(
@@ -228,11 +177,5 @@ export const PromptlessLiveBlock: Story = {
 		),
 		liveStatus: { phase: "idle", hasAccumulatedOutput: false },
 	},
-	play: async ({ canvasElement }) => {
-		await userEvent.click(
-			within(canvasElement).getByRole("button", {
-				name: "Working for at least 12s",
-			}),
-		);
-	},
+	play: expandBlock("Working for at least 12s"),
 };
