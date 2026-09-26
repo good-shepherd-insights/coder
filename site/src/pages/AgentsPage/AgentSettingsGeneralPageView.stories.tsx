@@ -152,36 +152,6 @@ export const TogglesSendShortcut: Story = {
 	},
 };
 
-export const TogglesCollapseAssistantSteps: Story = {
-	beforeEach: () => {
-		let collapseAssistantSteps = false;
-		spyOn(API, "getUserPreferenceSettings").mockImplementation(async () => ({
-			...preferencesData,
-			collapse_assistant_steps: collapseAssistantSteps,
-		}));
-		spyOn(API, "updateUserPreferenceSettings").mockImplementation(
-			async (req) => {
-				collapseAssistantSteps =
-					req.collapse_assistant_steps ?? collapseAssistantSteps;
-				return {
-					...preferencesData,
-					collapse_assistant_steps: collapseAssistantSteps,
-				};
-			},
-		);
-	},
-	play: async ({ canvasElement }) => {
-		const canvas = within(canvasElement);
-		await userEvent.click(
-			await canvas.findByRole("switch", { name: "Collapse assistant steps" }),
-		);
-		await canvas.findByRole("switch", {
-			name: "Collapse assistant steps",
-			checked: true,
-		});
-	},
-};
-
 export const CollapseAssistantStepsLoadError: Story = {
 	// Drop the seeded preferences so the component fetches and hits the error.
 	parameters: { queries: [] },

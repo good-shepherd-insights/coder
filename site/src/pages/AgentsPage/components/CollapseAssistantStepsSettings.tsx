@@ -36,14 +36,10 @@ export const CollapseAssistantStepsSettings: FC = () => {
 					aria-describedby={descriptionId}
 				/>
 			</div>
-			{query.isError && (
+			{(query.isError || mutation.isError) && (
 				<p className="m-0 text-xs text-content-destructive">
-					Failed to load your collapse assistant steps preference.
-				</p>
-			)}
-			{mutation.isError && (
-				<p className="m-0 text-xs text-content-destructive">
-					Failed to save your collapse assistant steps preference.
+					Failed to {query.isError ? "load" : "save"} your collapse assistant
+					steps preference.
 				</p>
 			)}
 		</div>
