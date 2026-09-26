@@ -10,6 +10,7 @@ import { parseMessagesWithMergedTools } from "./messageParsing";
 import {
 	MockCollapsedStepsPreferences,
 	MockLongTurnPageLoads,
+	MockQuestionCallMessage,
 	MockWorkingMessages,
 	pinFixtureClock,
 	workingFixtureTime,
@@ -19,6 +20,11 @@ const meta: Meta<typeof ConversationTimeline> = {
 	title: "pages/AgentsPage/ChatConversation/ConversationTimeline/WorkingBlocks",
 	component: ConversationTimeline,
 	beforeEach: pinFixtureClock,
+	parameters: {
+		queries: [
+			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
+		],
+	},
 	args: {
 		organizationId: "organization-id",
 		subagentTitles: new Map(),
@@ -42,20 +48,9 @@ const meta: Meta<typeof ConversationTimeline> = {
 export default meta;
 type Story = StoryObj<typeof ConversationTimeline>;
 
-export const Completed: Story = {
-	parameters: {
-		queries: [
-			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
-		],
-	},
-};
+export const Completed: Story = {};
 
 export const Expanded: Story = {
-	parameters: {
-		queries: [
-			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
-		],
-	},
 	play: async ({ canvasElement }) => {
 		await userEvent.click(
 			within(canvasElement).getByRole("button", {
@@ -66,11 +61,6 @@ export const Expanded: Story = {
 };
 
 export const Paginated: Story = {
-	parameters: {
-		queries: [
-			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
-		],
-	},
 	args: {
 		hasMoreMessages: true,
 		parsedMessages: parseMessagesWithMergedTools(MockWorkingMessages.slice(3)),
@@ -84,14 +74,7 @@ export const Paginated: Story = {
 	},
 };
 
-// Older rows land inside the expanded block's own scroller item, so the block
-// rather than the scroller has to keep the reading position.
 export const PrependIntoExpandedBlockKeepsReadingPosition: Story = {
-	parameters: {
-		queries: [
-			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
-		],
-	},
 	render: function Render(args) {
 		const [page, setPage] = useState(0);
 		// The button follows the rows so the scroller sees the previous first
@@ -122,41 +105,30 @@ export const PrependIntoExpandedBlockKeepsReadingPosition: Story = {
 			canvas.getByRole("button", { name: /Worked for at least/ }),
 		);
 		const viewport = canvas.getByRole("region", { name: "Messages" });
-		// The scroller stops following the bottom only on wheel, touch, or key
-		// input, so scroll up the way a reader does.
-		await fireEvent.wheel(viewport, { deltaY: -100 });
-		viewport.scrollTop = 0;
-		await waitFor(() => {
-			if (viewport.scrollTop !== 0) {
-				throw new Error("Waiting for the viewport to reach the top");
-			}
-		});
-		await userEvent.click(
-			canvas.getByRole("button", { name: "Load older messages" }),
-		);
-		await canvas.findByText(/echo step-15$/);
 		// History only pages while the reader sits at the very top, where the
-		// browser suspends its own scroll anchoring.
-		await fireEvent.wheel(viewport, { deltaY: -100 });
-		viewport.scrollTop = 0;
-		await waitFor(() => {
-			if (viewport.scrollTop !== 0) {
-				throw new Error("Waiting for the viewport to reach the top");
-			}
-		});
-		await userEvent.click(
-			canvas.getByRole("button", { name: "Load older messages" }),
-		);
+		// browser suspends its own scroll anchoring. The scroller stops
+		// following the bottom only on wheel, touch, or key input, so scroll
+		// up the way a reader does.
+		const loadOlderFromTop = async () => {
+			await fireEvent.wheel(viewport, { deltaY: -100 });
+			viewport.scrollTop = 0;
+			await waitFor(() => {
+				if (viewport.scrollTop !== 0) {
+					throw new Error("Waiting for the viewport to reach the top");
+				}
+			});
+			await userEvent.click(
+				canvas.getByRole("button", { name: "Load older messages" }),
+			);
+		};
+		await loadOlderFromTop();
+		await canvas.findByText(/echo step-15$/);
+		await loadOlderFromTop();
 		await canvas.findByText("Run every step");
 	},
 };
 
 export const FailedStepCounted: Story = {
-	parameters: {
-		queries: [
-			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
-		],
-	},
 	args: {
 		parsedMessages: parseMessagesWithMergedTools(
 			MockWorkingMessages.map((message) =>
@@ -195,30 +167,12 @@ export const FailedStepCounted: Story = {
 };
 
 export const QuestionStaysVisible: Story = {
-	parameters: {
-		queries: [
-			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
-		],
-	},
 	args: {
 		isChatCompleted: true,
 		onSendAskUserQuestionResponse: fn(),
 		parsedMessages: parseMessagesWithMergedTools([
 			...MockWorkingMessages.slice(0, 3),
-			{
-				...MockChatMessage,
-				id: 4,
-				role: "assistant",
-				created_at: workingFixtureTime(5),
-				content: [
-					{
-						type: "tool-call",
-						tool_call_id: "question",
-						tool_name: "ask_user_question",
-						args: {},
-					},
-				],
-			},
+			MockQuestionCallMessage,
 			{
 				...MockChatMessage,
 				id: 5,
@@ -255,22 +209,12 @@ export const QuestionStaysVisible: Story = {
 };
 
 export const Mobile: Story = {
-	parameters: {
-		queries: [
-			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
-		],
-	},
 	globals: { viewport: { value: "mobile1", isRotated: false } },
 };
 
 // Editing makes the block inert, so it has to expand before the edit starts;
 // the capture shows the outer item dimming the nested rows once.
 export const EditingPrecedingMessage: Story = {
-	parameters: {
-		queries: [
-			{ key: preferenceSettingsKey, data: MockCollapsedStepsPreferences },
-		],
-	},
 	render: function Render(args) {
 		const [editing, setEditing] = useState(false);
 		return (

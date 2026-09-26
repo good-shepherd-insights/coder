@@ -19,24 +19,24 @@ const continuesLiveBlock = (
 			identity.streamStartedAt !== undefined &&
 			identity.streamStartedAt === streamStartedAt));
 
-// Returns the inputs when nothing changed so the caller can skip setState.
+type LiveBlockKeys = {
+	itemKeys: ReadonlyMap<string, string>;
+	identity: LiveBlockIdentity | null;
+};
+
+// Returns the input state when nothing changed so the caller can skip setState.
 const reconcile = (
 	blocks: readonly WorkingBlock[],
 	streamStartedAt: string | undefined,
-	itemKeys: ReadonlyMap<string, string>,
-	identity: LiveBlockIdentity | null,
-): {
-	itemKeys: ReadonlyMap<string, string>;
-	identity: LiveBlockIdentity | null;
-} => {
-	let nextItemKeys = itemKeys;
-	let nextIdentity = identity;
+	state: LiveBlockKeys,
+): LiveBlockKeys => {
+	let { itemKeys: nextItemKeys, identity: nextIdentity } = state;
 	// A completed block may take over a live key by name only while nothing
 	// continues the live block itself. Head ordinals shift when an older page
 	// reveals an earlier block of the same turn, so the revealed block would
 	// otherwise alias the still-live one.
 	const liveBlockContinues = blocks.some((block) =>
-		continuesLiveBlock(block, identity, streamStartedAt),
+		continuesLiveBlock(block, state.identity, streamStartedAt),
 	);
 	for (const block of blocks) {
 		let itemKey = nextItemKeys.get(block.key);
@@ -65,7 +65,9 @@ const reconcile = (
 			nextIdentity = { itemKey, firstMemberId, streamStartedAt };
 		}
 	}
-	return { itemKeys: nextItemKeys, identity: nextIdentity };
+	return nextItemKeys === state.itemKeys && nextIdentity === state.identity
+		? state
+		: { itemKeys: nextItemKeys, identity: nextIdentity };
 };
 
 /**
@@ -78,16 +80,13 @@ export const useLiveBlockItemKeys = (
 	workingBlocks: readonly WorkingBlock[],
 	streamStartedAt: string | undefined,
 ): ReadonlyMap<string, string> => {
-	const [itemKeys, setItemKeys] = useState<ReadonlyMap<string, string>>(
-		new Map(),
-	);
-	const [identity, setIdentity] = useState<LiveBlockIdentity | null>(null);
-	const next = reconcile(workingBlocks, streamStartedAt, itemKeys, identity);
-	if (next.itemKeys !== itemKeys) {
-		setItemKeys(next.itemKeys);
-	}
-	if (next.identity !== identity) {
-		setIdentity(next.identity);
+	const [state, setState] = useState<LiveBlockKeys>({
+		itemKeys: new Map(),
+		identity: null,
+	});
+	const next = reconcile(workingBlocks, streamStartedAt, state);
+	if (next !== state) {
+		setState(next);
 	}
 	return next.itemKeys;
 };
