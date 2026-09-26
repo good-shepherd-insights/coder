@@ -190,10 +190,10 @@ type interruptionOutcome struct {
 	Kind runnerActionKind
 }
 
-// interruptCancelTimeout bounds the requests an interrupt sends to the
-// workspace agent for execute calls. It exists only so an unreachable
-// agent yields an unknown result: interrupt latency is not a concern,
-// and waiting for the agent's answer reports the real outcome.
+// interruptCancelTimeout bounds the cancel requests an interrupt sends
+// to the workspace agent. It exists only so an unreachable agent yields
+// an unknown result: interrupt latency is not a concern, and waiting for
+// the agent's answer reports the real outcome.
 const interruptCancelTimeout = time.Minute
 
 type taskStarter struct {
@@ -717,13 +717,12 @@ func dynamicToolNamesFromChat(chat database.Chat) map[string]bool {
 	return names
 }
 
-// interruptExecuteCalls ends the unresolved foreground execute calls in
-// messages, looks up the processes of the background ones, and returns
-// their results by provider tool call ID. A call without an entry keeps
-// the generic interrupted result. The message part buffer plays no part:
-// the canceled generation goroutine records completions and publishes
-// results before interrupt handling reads them, and it holds nothing
-// after an ownership change.
+// interruptExecuteCalls cancels the unresolved execute calls in messages
+// on the workspace agent and returns their results by provider tool call
+// ID. A call without an entry keeps the generic interrupted result. The
+// message part buffer plays no part: the canceled generation goroutine
+// records completions and publishes results before interrupt handling
+// reads them, and it holds nothing after an ownership change.
 func (s *taskStarter) interruptExecuteCalls(
 	ctx context.Context,
 	chat database.Chat,
@@ -763,27 +762,14 @@ func (s *taskStarter) interruptExecuteCalls(
 	defer workspaceCtx.close()
 	conn, err := workspaceCtx.getWorkspaceConn(agentCtx)
 	if err != nil {
-		// Without a workspace agent no process can be running, so the calls
-		// keep today's result, as in the execute tool.
-		if !chattool.HasNoWorkspaceAgent(err) {
-			for i, identity := range identities {
-				if calls[i].background {
-					results[i] = chattool.AgentUnreachableBackgroundExecuteResult(identity, err)
-				} else {
-					results[i] = chattool.AgentUnreachableExecuteResult(identity, err)
-				}
-				answered[i] = true
-			}
+		for i, identity := range identities {
+			results[i], answered[i] = chattool.InterruptExecuteUnreachable(identity, calls[i].args, err)
 		}
 	} else {
 		var wg sync.WaitGroup
 		for i, identity := range identities {
 			wg.Go(func() {
-				if calls[i].background {
-					results[i], answered[i] = chattool.InterruptBackgroundExecute(agentCtx, conn, identity)
-					return
-				}
-				results[i], answered[i] = chattool.InterruptExecute(agentCtx, conn, identity, calls[i].timeout)
+				results[i], answered[i] = chattool.InterruptExecute(agentCtx, conn, identity, calls[i].args)
 			})
 		}
 		wg.Wait()
@@ -808,18 +794,24 @@ func (s *taskStarter) interruptExecuteCalls(
 }
 
 // interruptedExecuteCall is an unresolved execute call that interrupt
-// handling acts on.
+// handling cancels.
 type interruptedExecuteCall struct {
 	toolCallID string
+	args       chattool.ExecuteArgs
+	// stop is what the cancel request asks for, which calls sharing a
+	// provider tool call ID must agree on.
+	stop interruptStop
+}
+
+type interruptStop struct {
 	background bool
-	// timeout is the effective timeout of a foreground call.
-	timeout time.Duration
+	runAge     time.Duration
 }
 
 // interruptedExecuteCalls returns the execute calls in localCalls that
-// interrupt handling acts on. An ID shared by several calls is returned
-// once, and only when every call with it is handled the same way,
-// because they share one tool call UUID.
+// interrupt handling cancels. An ID shared by several calls is returned
+// once, and only when every call with it asks for the same stop, because
+// they share one tool call UUID.
 func interruptedExecuteCalls(localCalls []fantasy.ToolCallContent) []interruptedExecuteCall {
 	byID := make(map[string]interruptedExecuteCall)
 	skip := make(map[string]bool)
@@ -827,7 +819,7 @@ func interruptedExecuteCalls(localCalls []fantasy.ToolCallContent) []interrupted
 	for _, call := range localCalls {
 		classified, ok := classifyExecuteCall(call)
 		prev, seen := byID[call.ToolCallID]
-		if !ok || (seen && prev != classified) {
+		if !ok || (seen && prev.stop != classified.stop) {
 			skip[call.ToolCallID] = true
 		}
 		if !seen {
@@ -844,10 +836,9 @@ func interruptedExecuteCalls(localCalls []fantasy.ToolCallContent) []interrupted
 	return calls
 }
 
-// classifyExecuteCall returns how interrupt handling acts on call. ok is
-// false for any other tool, for unparsable arguments, and for a
-// foreground call with an invalid timeout, for which the tool starts no
-// process.
+// classifyExecuteCall returns how interrupt handling cancels call. ok is
+// false for any other tool, for unparsable arguments, and for arguments
+// for which the tool starts no process.
 func classifyExecuteCall(call fantasy.ToolCallContent) (interruptedExecuteCall, bool) {
 	if call.ToolName != chattool.ExecuteToolName {
 		return interruptedExecuteCall{}, false
@@ -856,14 +847,15 @@ func classifyExecuteCall(call fantasy.ToolCallContent) (interruptedExecuteCall, 
 	if err := json.Unmarshal([]byte(call.Input), &args); err != nil {
 		return interruptedExecuteCall{}, false
 	}
-	if args.RunsInBackground() {
-		return interruptedExecuteCall{toolCallID: call.ToolCallID, background: true}, true
-	}
-	timeout, err := args.EffectiveTimeout(chattool.ExecuteDefaultTimeout)
-	if err != nil {
+	runAge, ok := args.InterruptStopRunAge()
+	if !ok {
 		return interruptedExecuteCall{}, false
 	}
-	return interruptedExecuteCall{toolCallID: call.ToolCallID, timeout: timeout}, true
+	return interruptedExecuteCall{
+		toolCallID: call.ToolCallID,
+		args:       args,
+		stop:       interruptStop{background: args.RunsInBackground(), runAge: runAge},
+	}, true
 }
 
 // committedPendingLocalToolCancellationMessages returns a result for

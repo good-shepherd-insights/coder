@@ -92,7 +92,7 @@ func TestExecuteToolCall(t *testing.T) {
 			name:  "AttachWaitsForRemainingTimeout",
 			input: `{"command":"make test","timeout":"10m"}`,
 			start: func(processID string) (workspacesdk.StartProcessResponse, error) {
-				return workspacesdk.StartProcessResponse{ID: processID, Started: true, AgeMs: (4 * time.Minute).Milliseconds()}, nil
+				return workspacesdk.StartProcessResponse{ID: processID, Started: true, RunAge: 4 * time.Minute}, nil
 			},
 			outputs: []outputCall{{wait: true, remaining: 6 * time.Minute, resp: workspacesdk.ProcessOutputResponse{ExitCode: exitCode(2), Output: "FAIL"}}},
 			check: func(t *testing.T, result chattool.ExecuteResult, _ string) {
@@ -110,7 +110,7 @@ func TestExecuteToolCall(t *testing.T) {
 			name:  "AttachWaitsAgainAfterAgentWaitCap",
 			input: `{"command":"make test","timeout":"10m"}`,
 			start: func(processID string) (workspacesdk.StartProcessResponse, error) {
-				return workspacesdk.StartProcessResponse{ID: processID, Started: true, AgeMs: (4 * time.Minute).Milliseconds()}, nil
+				return workspacesdk.StartProcessResponse{ID: processID, Started: true, RunAge: 4 * time.Minute}, nil
 			},
 			outputs: []outputCall{
 				{wait: true, remaining: 6 * time.Minute, resp: workspacesdk.ProcessOutputResponse{Running: true, Output: "partial"}},
@@ -127,7 +127,7 @@ func TestExecuteToolCall(t *testing.T) {
 			name:  "AttachNegativeAgeWaitsTimeout",
 			input: `{"command":"make test","timeout":"10m"}`,
 			start: func(processID string) (workspacesdk.StartProcessResponse, error) {
-				return workspacesdk.StartProcessResponse{ID: processID, Started: true, AgeMs: -time.Minute.Milliseconds()}, nil
+				return workspacesdk.StartProcessResponse{ID: processID, Started: true, RunAge: -time.Minute}, nil
 			},
 			outputs: []outputCall{{wait: true, remaining: 10 * time.Minute, resp: workspacesdk.ProcessOutputResponse{ExitCode: exitCode(0), Output: "ok"}}},
 			check: func(t *testing.T, result chattool.ExecuteResult, _ string) {
@@ -139,7 +139,7 @@ func TestExecuteToolCall(t *testing.T) {
 			name:  "AttachNoTimeoutLeftRunning",
 			input: `{"command":"make test","timeout":"10m"}`,
 			start: func(processID string) (workspacesdk.StartProcessResponse, error) {
-				return workspacesdk.StartProcessResponse{ID: processID, Started: true, AgeMs: (10 * time.Minute).Milliseconds()}, nil
+				return workspacesdk.StartProcessResponse{ID: processID, Started: true, RunAge: 10 * time.Minute}, nil
 			},
 			outputs: []outputCall{{resp: workspacesdk.ProcessOutputResponse{Running: true, Output: "partial"}}},
 			check: func(t *testing.T, result chattool.ExecuteResult, processID string) {
@@ -155,7 +155,7 @@ func TestExecuteToolCall(t *testing.T) {
 			name:  "AttachPastTimeoutExited",
 			input: `{"command":"make test","timeout":"10m"}`,
 			start: func(processID string) (workspacesdk.StartProcessResponse, error) {
-				return workspacesdk.StartProcessResponse{ID: processID, Started: true, AgeMs: (12 * time.Minute).Milliseconds()}, nil
+				return workspacesdk.StartProcessResponse{ID: processID, Started: true, RunAge: 12 * time.Minute}, nil
 			},
 			outputs: []outputCall{{resp: workspacesdk.ProcessOutputResponse{ExitCode: exitCode(3), Output: "exited"}}},
 			check: func(t *testing.T, result chattool.ExecuteResult, _ string) {
@@ -170,7 +170,7 @@ func TestExecuteToolCall(t *testing.T) {
 			name:  "AttachNoTimeoutLeftSnapshotFails",
 			input: `{"command":"make test","timeout":"10m"}`,
 			start: func(processID string) (workspacesdk.StartProcessResponse, error) {
-				return workspacesdk.StartProcessResponse{ID: processID, Started: true, AgeMs: (10 * time.Minute).Milliseconds()}, nil
+				return workspacesdk.StartProcessResponse{ID: processID, Started: true, RunAge: 10 * time.Minute}, nil
 			},
 			outputs: []outputCall{{err: xerrors.New("connection reset")}},
 			check: func(t *testing.T, result chattool.ExecuteResult, processID string) {
@@ -187,7 +187,7 @@ func TestExecuteToolCall(t *testing.T) {
 			name:  "OldAgent",
 			input: `{"command":"make test","timeout":"10m"}`,
 			start: func(string) (workspacesdk.StartProcessResponse, error) {
-				return workspacesdk.StartProcessResponse{ID: uuid.NewString(), Started: true, AgeMs: (4 * time.Minute).Milliseconds()}, nil
+				return workspacesdk.StartProcessResponse{ID: uuid.NewString(), Started: true, RunAge: 4 * time.Minute}, nil
 			},
 			outputs: []outputCall{{wait: true, remaining: 10 * time.Minute, resp: workspacesdk.ProcessOutputResponse{ExitCode: exitCode(0), Output: "ok"}}},
 			check: func(t *testing.T, result chattool.ExecuteResult, _ string) {
@@ -321,7 +321,7 @@ func TestExecuteToolCall(t *testing.T) {
 			name:  "Background",
 			input: `{"command":"make dev","run_in_background":true}`,
 			start: func(processID string) (workspacesdk.StartProcessResponse, error) {
-				return workspacesdk.StartProcessResponse{ID: processID, Started: true, AgeMs: (4 * time.Minute).Milliseconds()}, nil
+				return workspacesdk.StartProcessResponse{ID: processID, Started: true, RunAge: 4 * time.Minute}, nil
 			},
 			check: func(t *testing.T, result chattool.ExecuteResult, processID string) {
 				assert.True(t, result.Success)

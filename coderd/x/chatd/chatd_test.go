@@ -3390,7 +3390,7 @@ func TestActiveServer_InterruptionBehavior(t *testing.T) {
 				}
 				id := workspacesdk.ToolCallUUID(chatID, tc.MessageID, tc.ID).String()
 				startedProcessID.Store(id)
-				return workspacesdk.StartProcessResponse{ID: id, Started: true, AgeMs: 1_000}, nil
+				return workspacesdk.StartProcessResponse{ID: id, Started: true, RunAge: time.Second}, nil
 			}).Times(1)
 		mockConn.EXPECT().ProcessOutput(gomock.Any(), gomock.Any(), gomock.Any()).
 			DoAndReturn(func(ctx context.Context, id string, opts *workspacesdk.ProcessOutputOptions) (workspacesdk.ProcessOutputResponse, error) {
@@ -3405,14 +3405,18 @@ func TestActiveServer_InterruptionBehavior(t *testing.T) {
 				return workspacesdk.ProcessOutputResponse{}, ctx.Err()
 			}).AnyTimes()
 		var canceledProcessID atomic.Value
-		mockConn.EXPECT().CancelProcess(gomock.Any(), gomock.Any()).
-			DoAndReturn(func(ctx context.Context, id string) (workspacesdk.CancelProcessResponse, error) {
+		// The command's timeout is 10m, so a process younger than that is
+		// stopped.
+		mockConn.EXPECT().CancelToolCall(gomock.Any(), gomock.Any(), workspacesdk.CancelToolCallRequest{StopIfRunAgeBelowMs: (10 * time.Minute).Milliseconds()}).
+			DoAndReturn(func(ctx context.Context, id string, _ workspacesdk.CancelToolCallRequest) (workspacesdk.CancelToolCallResponse, error) {
 				if tc, ok := workspacesdk.ToolCallFromContext(ctx); !ok || tc.ID != "tc-exec" {
 					t.Errorf("cancel request tool call = %+v (set %v), want tool call tc-exec", tc, ok)
 				}
 				canceledProcessID.Store(id)
 				exitCode := -1
-				return workspacesdk.CancelProcessResponse{Started: true, Canceled: true, Output: "partial output", ExitCode: &exitCode, AgeMs: 1_500}, nil
+				return workspacesdk.CancelToolCallResponse{Started: true, Process: &workspacesdk.ToolCallProcess{
+					Canceled: true, Output: "partial output", ExitCode: &exitCode, RunAgeMs: 1_500,
+				}}, nil
 			}).Times(1)
 
 		server := newActiveTestServer(t, db, ps, func(cfg *chatd.Config) {
