@@ -2,11 +2,47 @@ import { ListChecksIcon, TriangleAlertIcon } from "lucide-react";
 import { Component, type FC, type ReactNode } from "react";
 import { useTime } from "#/hooks/useTime";
 import { ToolCall } from "../ChatElements/tools/ToolCall";
-import {
-	didPrependIntoBlock,
-	formatWorkingDuration,
-	type WorkingBlock,
-} from "./workingBlockGrouping";
+import type { WorkingBlock } from "./workingBlockGrouping";
+
+export const formatWorkingDuration = (milliseconds: number): string => {
+	const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
+	const seconds = totalSeconds % 60;
+	if (hours > 0) {
+		return `${hours}h ${minutes}m`;
+	}
+	if (minutes > 0) {
+		return `${minutes}m ${seconds}s`;
+	}
+	return `${seconds}s`;
+};
+
+/**
+ * Whether older history joined the front of a block between two renders. A
+ * block that only had its live row has no previous member, so the live row
+ * becoming its persisted step is not a prepend.
+ */
+export const didPrependIntoBlock = (
+	previousMemberIds: readonly number[],
+	memberIds: readonly number[],
+): boolean => {
+	const previousFirst = previousMemberIds[0];
+	return (
+		previousFirst !== undefined &&
+		memberIds[0] < previousFirst &&
+		memberIds.includes(previousFirst)
+	);
+};
+
+/**
+ * A partial block may be missing earlier rows that are not loaded yet, so its
+ * duration and counts are lower bounds.
+ */
+const atLeast = (block: WorkingBlock) => (block.isPartial ? "at least " : "");
+
+const countLabel = (block: WorkingBlock, count: number, noun: string) =>
+	`${count} ${noun}${count === 1 ? "" : "s"}${block.isPartial ? " or more" : ""}`;
 
 type LiveLabelProps = { block: WorkingBlock };
 
@@ -19,31 +55,17 @@ const LiveLabel: FC<LiveLabelProps> = ({ block }) => {
 	}
 	const elapsed = formatWorkingDuration(now - block.startedAt);
 	return (
-		<ToolCall.Label>
-			{block.isPartial
-				? `Working for at least ${elapsed}`
-				: `Working for ${elapsed}`}
-		</ToolCall.Label>
+		<ToolCall.Label>{`Working for ${atLeast(block)}${elapsed}`}</ToolCall.Label>
 	);
 };
 
-const pluralize = (count: number, noun: string): string =>
-	`${count} ${noun}${count === 1 ? "" : "s"}`;
-
-/**
- * A partial block may be missing earlier rows that are not loaded yet, so its
- * duration and step count are lower bounds (the live label does the same).
- */
 const getCompletedWorkingLabel = (block: WorkingBlock): string => {
-	const steps = pluralize(block.stepCount, "step");
-	const stepsLabel = block.isPartial ? `${steps} or more` : steps;
+	const steps = countLabel(block, block.stepCount, "step");
 	if (block.startedAt === undefined || block.endedAt === undefined) {
-		return `Completed ${stepsLabel}`;
+		return `Completed ${steps}`;
 	}
 	const duration = formatWorkingDuration(block.endedAt - block.startedAt);
-	return block.isPartial
-		? `Worked for at least ${duration} (${stepsLabel})`
-		: `Worked for ${duration} (${stepsLabel})`;
+	return `Worked for ${atLeast(block)}${duration} (${steps})`;
 };
 
 const getScrollParent = (element: HTMLElement): HTMLElement | null => {
@@ -67,29 +89,26 @@ type WorkingBlockContentProps = {
  * browsers skip scroll anchoring at the top. Scroll by the growth instead.
  *
  * A class component because getSnapshotBeforeUpdate is the only React API
- * that measures the DOM right before a commit mutates it. Nested rows expand
- * on their own state without rendering this component, so any height cached
- * at an earlier render or observer callback can be stale by the time a
- * prepend commits, and the growth would then include the nested resize.
+ * that measures the DOM right before a commit; nested rows resize on their
+ * own state, so a height cached any earlier can be stale.
  */
 class WorkingBlockContent extends Component<WorkingBlockContentProps> {
 	private content: HTMLDivElement | null = null;
 
-	getSnapshotBeforeUpdate(): number | null {
+	getSnapshotBeforeUpdate(previous: WorkingBlockContentProps): number | null {
+		if (!didPrependIntoBlock(previous.memberIds, this.props.memberIds)) {
+			return null;
+		}
 		return this.content?.offsetHeight ?? null;
 	}
 
 	componentDidUpdate(
-		previous: WorkingBlockContentProps,
+		_previous: WorkingBlockContentProps,
 		_state: unknown,
 		heightBefore: number | null,
 	) {
 		const content = this.content;
-		if (
-			!content ||
-			heightBefore === null ||
-			!didPrependIntoBlock(previous.memberIds, this.props.memberIds)
-		) {
+		if (!content || heightBefore === null) {
 			return;
 		}
 		const delta = content.offsetHeight - heightBefore;
@@ -157,9 +176,7 @@ export const WorkingBlockDisclosure: FC<WorkingBlockDisclosureProps> = ({
 						{/* Separates the badge from the label in the button's accessible name. */}
 						<span className="sr-only">, </span>
 						<TriangleAlertIcon aria-hidden className="size-3.5 shrink-0" />
-						{block.isPartial
-							? `${pluralize(block.failedCount, "failed step")} or more`
-							: pluralize(block.failedCount, "failed step")}
+						{countLabel(block, block.failedCount, "failed step")}
 					</span>
 				)}
 				<ToolCall.Chevron />

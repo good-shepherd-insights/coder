@@ -402,41 +402,6 @@ const ChatMessageItem = memo<{
 	},
 );
 
-// The newest member row's decision wins over the item key's.
-const isBlockExpanded = (
-	expandedBlocks: ReadonlyMap<string, boolean>,
-	itemKey: string,
-	memberKeys: readonly string[],
-): boolean => {
-	let expanded = expandedBlocks.get(itemKey) ?? false;
-	for (const memberKey of memberKeys) {
-		const decision = expandedBlocks.get(memberKey);
-		if (decision !== undefined) {
-			expanded = decision;
-		}
-	}
-	return expanded;
-};
-
-/**
- * Expansion is recorded on the block's durable member rows and its item key,
- * so it survives the live-to-complete handoff and prepends. The live row is
- * excluded so the choice does not carry into the next turn.
- */
-const recordBlockExpansion = (
-	expandedBlocks: ReadonlyMap<string, boolean>,
-	itemKey: string,
-	memberKeys: readonly string[],
-	expanded: boolean,
-): ReadonlyMap<string, boolean> => {
-	const next = new Map(expandedBlocks);
-	next.set(itemKey, expanded);
-	for (const memberKey of memberKeys) {
-		next.set(memberKey, expanded);
-	}
-	return next;
-};
-
 interface ConversationTimelineProps {
 	hasMoreMessages?: boolean;
 	chatStatus: TypesGen.ChatStatus | null;
@@ -691,16 +656,20 @@ export const ConversationTimeline = memo<ConversationTimelineProps>(
 				{renderRows.map((row, index) => {
 					const block = blockByFirstRow.get(index);
 					if (block) {
+						// Expansion is recorded on the block's durable member rows and its
+						// item key, so it survives the live-to-complete handoff and
+						// prepends. The live row is excluded so the choice does not carry
+						// into the next turn. The newest member's decision wins.
 						const memberKeys = block.rowIndices.flatMap((rowIndex) => {
 							const member = renderRows[rowIndex];
 							return member.type === "message" ? [member.key] : [];
 						});
 						const itemKey = liveItemKeys.get(block.key) ?? block.key;
-						const expanded = isBlockExpanded(
-							expandedBlocks,
-							itemKey,
-							memberKeys,
-						);
+						const expanded =
+							expandedBlocks.get(
+								memberKeys.findLast((key) => expandedBlocks.has(key)) ??
+									itemKey,
+							) ?? false;
 						const isAfterEditingMessage =
 							row.type === "message" &&
 							afterEditingMessageIds.has(row.entry.message.id);
@@ -718,14 +687,13 @@ export const ConversationTimeline = memo<ConversationTimelineProps>(
 									block={block}
 									expanded={expanded}
 									onExpandedChange={(value) =>
-										setExpandedBlocks((previous) =>
-											recordBlockExpansion(
-												previous,
-												itemKey,
-												memberKeys,
-												value,
-											),
-										)
+										setExpandedBlocks((previous) => {
+											const next = new Map(previous);
+											for (const key of [itemKey, ...memberKeys]) {
+												next.set(key, value);
+											}
+											return next;
+										})
 									}
 								>
 									{expanded &&
