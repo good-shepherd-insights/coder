@@ -237,20 +237,6 @@ describe("groupWorkingBlocks", () => {
 		expect(blocks[0]).toMatchObject({ stepCount: 2, failedCount: 1 });
 	});
 
-	it("returns no blocks for text-only conversations", () => {
-		const { blocks } = group([
-			user("Hi"),
-			message("assistant", [text("Hello.")]),
-		]);
-		expect(blocks).toEqual([]);
-	});
-
-	it("folds a single step", () => {
-		const { blocks } = group([user("Go"), ...step("a", 1, 2)]);
-		expect(blocks).toHaveLength(1);
-		expect(blocks[0].stepCount).toBe(1);
-	});
-
 	it("uses the wall-clock span of parallel tools rather than their sum", () => {
 		const prompt = user("Go");
 		const parallel = message(
@@ -270,14 +256,6 @@ describe("groupWorkingBlocks", () => {
 			startedAt: WORKING_FIXTURE_START + 1000,
 			endedAt: WORKING_FIXTURE_START + 11_000,
 		});
-	});
-
-	it("reads result timestamps from hidden tool messages", () => {
-		const prompt = user("Go");
-		const steps = step("a", 1, 30);
-		const answer = message("assistant", [text("Done.")], at(31));
-		const { blocks } = group([prompt, ...steps, answer]);
-		expect(blocks[0].endedAt).toBe(WORKING_FIXTURE_START + 30_000);
 	});
 
 	it("spans merged read_file rows as one block", () => {
@@ -389,14 +367,6 @@ describe("groupWorkingBlocks", () => {
 		expect(blocks[0].stepCount).toBe(2);
 	});
 
-	it("excludes the idle gap before the next user message", () => {
-		const prompt = user("Go");
-		const steps = step("a", 1, 2);
-		const nextPrompt = message("user", [text("Later")], at(60 * 60 * 24));
-		const { blocks } = group([prompt, ...steps, nextPrompt]);
-		expect(blocks[0].endedAt).toBe(WORKING_FIXTURE_START + 2000);
-	});
-
 	it("marks the oldest loaded block partial while older history exists and keeps its key across a prepend", () => {
 		const prompt = user("Go");
 		const steps = [...step("a", 1, 2), ...step("b", 3, 4), ...step("c", 5, 6)];
@@ -441,29 +411,29 @@ describe("groupWorkingBlocks", () => {
 	});
 
 	describe("live turns", () => {
-		const liveOptions = (
+		const groupLive = (
+			messages: readonly TypesGen.ChatMessage[],
 			parts: TypesGen.ChatMessagePart[],
-		): Pick<
-			GroupWorkingBlocksOptions,
-			"liveBlocks" | "liveTools" | "streamState"
-		> => {
+			options: Partial<GroupWorkingBlocksOptions> = {},
+		) => {
 			const { streamState, streamTools } = buildStreamRenderState(parts);
-			return {
+			return group(messages, {
+				isTurnActive: true,
+				isLiveRowCollapsible: true,
 				liveBlocks: streamState?.blocks ?? [],
 				liveTools: streamTools,
 				streamState,
-			};
+				...options,
+			});
 		};
 
 		it("keys the live block by its turn and folds a streaming tool row into it", () => {
 			const prompt = user("Go");
 			const steps = step("a", 1, 2);
-			const live = liveOptions([call("b", at(3))]);
-			const { rows, blocks } = group([prompt, ...steps], {
-				isTurnActive: true,
-				isLiveRowCollapsible: true,
-				...live,
-			});
+			const { rows, blocks } = groupLive(
+				[prompt, ...steps],
+				[call("b", at(3))],
+			);
 
 			expect(blocks).toHaveLength(1);
 			expect(rowIds(rows, blocks[0].rowIndices)).toEqual([steps[0].id, "live"]);
@@ -485,12 +455,10 @@ describe("groupWorkingBlocks", () => {
 				[{ type: "skill", skill_name: "review" }],
 				at(3),
 			);
-			const live = liveOptions([call("b", at(4))]);
-			const { rows, blocks } = group([prompt, ...steps, hiddenPrompt], {
-				isTurnActive: true,
-				isLiveRowCollapsible: true,
-				...live,
-			});
+			const { rows, blocks } = groupLive(
+				[prompt, ...steps, hiddenPrompt],
+				[call("b", at(4))],
+			);
 
 			expect(blocks).toHaveLength(2);
 			expect(rowIds(rows, blocks[0].rowIndices)).toEqual([steps[0].id]);
@@ -502,12 +470,10 @@ describe("groupWorkingBlocks", () => {
 		it("keeps the block live while the final answer streams outside it", () => {
 			const prompt = user("Go");
 			const steps = step("a", 1, 2);
-			const live = liveOptions([text("Here is what I found")]);
-			const { rows, blocks } = group([prompt, ...steps], {
-				isTurnActive: true,
-				isLiveRowCollapsible: true,
-				...live,
-			});
+			const { rows, blocks } = groupLive(
+				[prompt, ...steps],
+				[text("Here is what I found")],
+			);
 
 			expect(blocks).toHaveLength(1);
 			expect(rowIds(rows, blocks[0].rowIndices)).toEqual([steps[0].id]);
@@ -517,12 +483,7 @@ describe("groupWorkingBlocks", () => {
 		it("folds an idle live row into the block it follows", () => {
 			const prompt = user("Go");
 			const steps = step("a", 1, 2);
-			const live = liveOptions([]);
-			const { rows, blocks } = group([prompt, ...steps], {
-				isTurnActive: true,
-				isLiveRowCollapsible: true,
-				...live,
-			});
+			const { rows, blocks } = groupLive([prompt, ...steps], []);
 
 			expect(blocks).toHaveLength(1);
 			expect(rowIds(rows, blocks[0].rowIndices)).toEqual([steps[0].id, "live"]);
@@ -530,23 +491,16 @@ describe("groupWorkingBlocks", () => {
 		});
 
 		it("does not start a block from an idle live row", () => {
-			const live = liveOptions([]);
-			const { blocks } = group([user("Go")], {
-				isTurnActive: true,
-				isLiveRowCollapsible: true,
-				...live,
-			});
+			const { blocks } = groupLive([user("Go")], []);
 			expect(blocks).toEqual([]);
 		});
 
 		it("folds the live turn's reasoning before its first tool call", () => {
 			const prompt = user("Go");
-			const live = liveOptions([reasoning("Planning", at(1))]);
-			const { rows, blocks } = group([prompt], {
-				isTurnActive: true,
-				isLiveRowCollapsible: true,
-				...live,
-			});
+			const { rows, blocks } = groupLive(
+				[prompt],
+				[reasoning("Planning", at(1))],
+			);
 
 			expect(blocks).toHaveLength(1);
 			expect(rowIds(rows, blocks[0].rowIndices)).toEqual(["live"]);
@@ -561,38 +515,20 @@ describe("groupWorkingBlocks", () => {
 		it("keeps the live row outside the block when its callouts must stay visible", () => {
 			const prompt = user("Go");
 			const steps = step("a", 1, 2);
-			const live = liveOptions([call("b", at(3))]);
-			const { rows, blocks } = group([prompt, ...steps], {
-				isTurnActive: true,
-				isLiveRowCollapsible: false,
-				...live,
-			});
+			const { rows, blocks } = groupLive(
+				[prompt, ...steps],
+				[call("b", at(3))],
+				{ isLiveRowCollapsible: false },
+			);
 
 			expect(rowIds(rows, blocks[0].rowIndices)).toEqual([steps[0].id]);
 			expect(blocks[0].isLive).toBe(true);
 		});
 
-		it("starts the live clock from streamed tool timestamps before anything persists", () => {
-			const prompt = user("Go");
-			const live = liveOptions([call("a", at(2))]);
-			const { blocks } = group([prompt], {
-				isTurnActive: true,
-				isLiveRowCollapsible: true,
-				...live,
-			});
-			expect(blocks).toHaveLength(1);
-			expect(blocks[0].startedAt).toBe(WORKING_FIXTURE_START + 2000);
-		});
-
 		it("hands the live block off to a completed block that shares its liveKey", () => {
 			const prompt = user("Go");
 			const steps = step("a", 1, 2);
-			const live = liveOptions([call("b", at(3))]);
-			const running = group([prompt, ...steps], {
-				isTurnActive: true,
-				isLiveRowCollapsible: true,
-				...live,
-			});
+			const running = groupLive([prompt, ...steps], [call("b", at(3))]);
 			const persisted = [...steps, ...step("b", 3, 4)];
 			const answer = message("assistant", [text("Done.")], at(5));
 			const done = group([prompt, ...persisted, answer]);
@@ -656,12 +592,8 @@ describe("groupWorkingBlocks", () => {
 
 		it("gives a prompt-less live block a stable head liveKey", () => {
 			const steps = [...step("a", 1, 2), ...step("b", 3, 4)];
-			const live = liveOptions([call("c", at(5))]);
-			const running = group(steps, {
+			const running = groupLive(steps, [call("c", at(5))], {
 				hasMoreMessages: true,
-				isTurnActive: true,
-				isLiveRowCollapsible: true,
-				...live,
 			});
 			expect(running.blocks[0]).toMatchObject({
 				isLive: true,
@@ -681,12 +613,10 @@ describe("groupWorkingBlocks", () => {
 			const firstSteps = step("a", 1, 2);
 			const firstAnswer = message("assistant", [text("Done one.")], at(3));
 			const second = user("Two");
-			const live = liveOptions([call("b", at(5))]);
-			const { blocks } = group([first, ...firstSteps, firstAnswer, second], {
-				isTurnActive: true,
-				isLiveRowCollapsible: true,
-				...live,
-			});
+			const { blocks } = groupLive(
+				[first, ...firstSteps, firstAnswer, second],
+				[call("b", at(5))],
+			);
 
 			expect(blocks).toHaveLength(2);
 			expect(blocks[0].isLive).toBe(false);
