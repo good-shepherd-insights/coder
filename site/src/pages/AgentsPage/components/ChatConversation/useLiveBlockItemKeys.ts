@@ -51,9 +51,7 @@ const reconcile = (
 			if (itemKey === undefined) {
 				continue;
 			}
-			const next = new Map(nextItemKeys);
-			next.set(block.key, itemKey);
-			nextItemKeys = next;
+			nextItemKeys = new Map(nextItemKeys).set(block.key, itemKey);
 		}
 		const firstMemberId = block.memberIds[0];
 		if (

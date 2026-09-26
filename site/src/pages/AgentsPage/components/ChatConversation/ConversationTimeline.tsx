@@ -672,10 +672,9 @@ export const ConversationTimeline = memo<ConversationTimelineProps>(
 				{renderRows.map((row, index) => {
 					const block = blockByFirstRow.get(index);
 					if (block) {
-						// Expansion is recorded on the block's durable member rows and its
-						// item key, so it survives the live-to-complete handoff and
-						// prepends. The live row is excluded so the choice does not carry
-						// into the next turn. The newest member's decision wins.
+						// Keyed on durable member rows and the item key, excluding the live
+						// row so the choice does not carry into the next turn; the newest
+						// member wins.
 						const memberKeys = block.rowIndices.flatMap((rowIndex) => {
 							const member = renderRows[rowIndex];
 							return member.type === "message" ? [member.key] : [];
