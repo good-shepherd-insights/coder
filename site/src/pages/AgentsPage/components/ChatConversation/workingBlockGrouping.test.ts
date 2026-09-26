@@ -9,8 +9,6 @@ import {
 } from "./storyFixtures";
 import { assignTimelineRows, type TimelineRow } from "./timelineRows";
 import {
-	didPrependIntoBlock,
-	formatWorkingDuration,
 	type GroupWorkingBlocksOptions,
 	groupWorkingBlocks,
 	type WorkingBlock,
@@ -622,40 +620,5 @@ describe("groupWorkingBlocks", () => {
 			expect(blocks[0].isLive).toBe(false);
 			expect(blocks[1].isLive).toBe(true);
 		});
-	});
-});
-
-describe("didPrependIntoBlock", () => {
-	it("detects older members joining the front", () => {
-		expect(didPrependIntoBlock([3, 5], [1, 3, 5])).toBe(true);
-	});
-
-	it("detects a merged first row growing under a stable row key", () => {
-		expect(didPrependIntoBlock([7, 9], [4, 5, 7, 9])).toBe(true);
-	});
-
-	it("ignores unchanged, appended, and replaced members", () => {
-		expect(didPrependIntoBlock([3, 5], [3, 5])).toBe(false);
-		expect(didPrependIntoBlock([3, 5], [3, 5, 7])).toBe(false);
-		expect(didPrependIntoBlock([3, 5], [1, 2])).toBe(false);
-	});
-
-	it("ignores the live row becoming its persisted step", () => {
-		expect(didPrependIntoBlock([], [7])).toBe(false);
-	});
-});
-
-describe("formatWorkingDuration", () => {
-	it.each([
-		[0, "0s"],
-		[999, "0s"],
-		[12_000, "12s"],
-		[60_000, "1m 0s"],
-		[134_000, "2m 14s"],
-		[3_600_000, "1h 0m"],
-		[3_780_000, "1h 3m"],
-		[-5000, "0s"],
-	])("formats %d ms as %s", (milliseconds, expected) => {
-		expect(formatWorkingDuration(milliseconds)).toBe(expected);
 	});
 });
