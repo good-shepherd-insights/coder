@@ -37,17 +37,17 @@ type API struct {
 	logger    slog.Logger
 	manager   *manager
 	pathStore *agentgit.PathStore
-	// toolCalls runs the start route at most once per tool call. Nil
+	// toolCallStore runs the start route at most once per tool call. Nil
 	// leaves tool call headers unhandled.
-	toolCalls *agenttoolcall.Store
+	toolCallStore *agenttoolcall.Store
 }
 
 // Option configures an API.
 type Option func(*apiOptions)
 
 type apiOptions struct {
-	clock     quartz.Clock
-	toolCalls *agenttoolcall.Store
+	clock         quartz.Clock
+	toolCallStore *agenttoolcall.Store
 }
 
 // WithClock sets the clock used for process timestamps and run age.
@@ -63,7 +63,7 @@ func WithClock(clock quartz.Clock) Option {
 // processes from being reaped while they are current.
 func WithToolCallStore(store *agenttoolcall.Store) Option {
 	return func(o *apiOptions) {
-		o.toolCalls = store
+		o.toolCallStore = store
 	}
 }
 
@@ -74,10 +74,10 @@ func NewAPI(logger slog.Logger, execer agentexec.Execer, fs afero.Fs, pathStore 
 		opt(&options)
 	}
 	return &API{
-		logger:    logger,
-		manager:   newManager(logger, execer, fs, envInfo, updateEnv, workingDir, options.clock, options.toolCalls),
-		pathStore: pathStore,
-		toolCalls: options.toolCalls,
+		logger:        logger,
+		manager:       newManager(logger, execer, fs, envInfo, updateEnv, workingDir, options.clock, options.toolCallStore),
+		pathStore:     pathStore,
+		toolCallStore: options.toolCallStore,
 	}
 }
 
@@ -90,8 +90,8 @@ func (api *API) Close() error {
 // Routes returns the HTTP handler for process-related routes.
 func (api *API) Routes() http.Handler {
 	r := chi.NewRouter()
-	if api.toolCalls != nil {
-		r.With(api.toolCalls.Middleware).Post("/start", api.handleStartProcess)
+	if api.toolCallStore != nil {
+		r.With(api.toolCallStore.Middleware).Post("/start", api.handleStartProcess)
 	} else {
 		r.Post("/start", api.handleStartProcess)
 	}
@@ -128,14 +128,12 @@ func (api *API) handleStartProcess(rw http.ResponseWriter, r *http.Request) {
 
 	// Behind the tool call middleware, the process ID is the tool call
 	// UUID, so chatd can address the process without this response.
-	id := uuid.New().String()
-	var key *agenttoolcall.Key
-	if toolCall, ok := agenttoolcall.FromContext(ctx); ok {
-		id = toolCall.UUID.String()
-		key = &toolCall.Key
+	var toolCall *agenttoolcall.ToolCall
+	if tc, ok := agenttoolcall.FromContext(ctx); ok {
+		toolCall = &tc
 	}
 
-	proc, err := api.manager.start(req, chatID, id, key)
+	proc, err := api.manager.start(req, chatID, toolCall)
 	if err != nil {
 		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
 			Message: "Failed to start process.",

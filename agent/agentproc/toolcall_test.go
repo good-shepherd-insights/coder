@@ -464,6 +464,31 @@ func TestToolCallRunAge(t *testing.T) {
 	assert.EqualValues(t, 1500, resp.Process.RunAgeMs)
 }
 
+func TestToolCallProcessRunAgeStartsWithRecord(t *testing.T) {
+	t.Parallel()
+
+	// Advancing the clock while the start spawns the process separates
+	// the record's creation from the spawn.
+	var clock *quartz.Mock
+	updateEnv := func(env []string) ([]string, error) {
+		clock.Advance(300 * time.Millisecond)
+		return env, nil
+	}
+	_, handler, clock := newToolCallAPI(t, longRunning, nil, updateEnv)
+	chatID := uuid.New()
+
+	w := postStart(t, handler, workspacesdk.StartProcessRequest{Command: "true"}, toolCallHeaders(chatID, 1, "call", 0))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, "300", w.Header().Get(workspacesdk.CoderToolCallRunAgeMsHeader))
+	var start workspacesdk.StartProcessResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&start))
+	waitForExit(t, handler, start.ID)
+
+	resp := requireCancel(t, handler, chatID, 1, "call", 0, 0)
+	require.NotNil(t, resp.Process)
+	assert.EqualValues(t, 300, resp.Process.RunAgeMs, "the process run age starts with the record, like the header")
+}
+
 func TestToolCallProcessReaping(t *testing.T) {
 	t.Parallel()
 
