@@ -1,4 +1,3 @@
-import { MessageScroller } from "@shadcn/react/message-scroller";
 import type { Decorator, Meta, StoryObj } from "@storybook/react-vite";
 import {
 	expect,
@@ -14,6 +13,7 @@ import { preferenceSettingsKey } from "#/api/queries/users";
 import type * as TypesGen from "#/api/typesGenerated";
 import { MockChatFileMetadata } from "#/testHelpers/chatEntities";
 import { MockUserPreferenceSettings } from "#/testHelpers/entities";
+import { MessageScroller } from "#/vendor/message-scroller";
 import { getChatFileURL } from "../../utils/chatAttachments";
 import { ChatMessageScroller } from "../ChatMessageScroller";
 import { ConversationTimeline } from "./ConversationTimeline";
@@ -608,7 +608,7 @@ export const FindToolsSearchResult: Story = {
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		const summary = canvas.getByRole("button", {
-			name: "Searched tools: github issues, pull requests, name:github__list_issues -> 2 matched",
+			name: "Matched 2 tools: github__list_issues, github__list_pull_requests",
 		});
 		await userEvent.click(summary);
 	},
@@ -2394,6 +2394,31 @@ export const ThinkingBlockWithShellTools: Story = {
 						tool_call_id: "tool-2",
 						tool_name: "process_output",
 						result: { output: "Spacing looks stable." },
+					},
+				],
+			},
+		]),
+	},
+};
+
+export const UserMessageWithWorkspaceFileReference: Story = {
+	args: {
+		...defaultArgs,
+		parsedMessages: buildMessages([
+			{
+				...baseMessage,
+				id: 1,
+				role: "user",
+				content: [
+					{ type: "text", text: "Unzip this in my workspace" },
+					{
+						type: "workspace-file-reference",
+						workspace_file_path:
+							"/home/coder/.coder/chats/story-chat/files/dataset.zip",
+						workspace_file_name: "dataset.zip",
+						workspace_file_size: 4096,
+						workspace_file_media_type: "application/zip",
+						workspace_file_workspace_id: "ws-1",
 					},
 				],
 			},

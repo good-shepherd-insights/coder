@@ -269,18 +269,18 @@ export class SmoothTextEngine {
 
 // ── Hook ────────────────────────────────────────────────────────────
 
-interface UseSmoothStreamingTextOptions {
+type UseSmoothStreamingTextOptions = {
 	fullText: string;
 	isStreaming: boolean;
 	bypassSmoothing: boolean;
 	/** Changing this resets the engine (new stream). */
 	streamKey: string;
-}
+};
 
-interface UseSmoothStreamingTextResult {
+type UseSmoothStreamingTextResult = {
 	visibleText: string;
 	isCaughtUp: boolean;
-}
+};
 
 // Module-scoped grapheme segmenter, created once and shared across
 // all hook instances. Falls back to codepoint iteration when the
@@ -288,14 +288,14 @@ interface UseSmoothStreamingTextResult {
 
 // Minimal type for the Intl.Segmenter API which is widely supported
 // at runtime but not included in all TypeScript lib bundles.
-interface GraphemeSegment {
+type GraphemeSegment = {
 	index: number;
 	segment: string;
-}
+};
 
-interface GraphemeSegmenterInstance {
+type GraphemeSegmenterInstance = {
 	segment(input: string): Iterable<GraphemeSegment>;
-}
+};
 
 const graphemeSegmenter: GraphemeSegmenterInstance | null = (() => {
 	try {

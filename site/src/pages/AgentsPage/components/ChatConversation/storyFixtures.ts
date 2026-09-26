@@ -131,7 +131,6 @@ export const MockWorkingBlock: WorkingBlock = {
 const workingStepMessages = (
 	id: number,
 	toolCallId: string,
-	output: string,
 	callAt: number,
 	resultAt: number,
 ): TypesGen.ChatMessage[] => [
@@ -160,7 +159,7 @@ const workingStepMessages = (
 				type: "tool-result",
 				tool_call_id: toolCallId,
 				tool_name: "execute",
-				result: { output, exit_code: "0" },
+				result: { output: `${toolCallId} output`, exit_code: "0" },
 				created_at: workingFixtureTime(resultAt),
 			},
 		],
@@ -178,8 +177,8 @@ export const MockWorkingMessages: TypesGen.ChatMessage[] = [
 		created_at: workingFixtureTime(0),
 		content: [{ type: "text", text: "Inspect the workspace" }],
 	},
-	...workingStepMessages(2, "first", "First output", 1, 4),
-	...workingStepMessages(4, "second", "Second output", 5, 13),
+	...workingStepMessages(2, "first", 1, 4),
+	...workingStepMessages(4, "second", 5, 13),
 	{
 		...MockChatMessage,
 		id: 6,
@@ -216,13 +215,7 @@ export const buildReconnectState = (
 });
 
 const MockLongTurn = Array.from({ length: 60 }, (_, index) =>
-	workingStepMessages(
-		100 + index * 2,
-		`step-${index}`,
-		`step-${index}`,
-		index,
-		index,
-	),
+	workingStepMessages(100 + index * 2, `step-${index}`, index, index),
 ).flat();
 const MockLongTurnPrompt: TypesGen.ChatMessage = {
 	...MockChatMessage,
