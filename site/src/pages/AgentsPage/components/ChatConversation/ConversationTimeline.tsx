@@ -1,7 +1,3 @@
-import {
-	MessageScroller,
-	useMessageScroller,
-} from "@shadcn/react/message-scroller";
 import { cn } from "cn";
 import {
 	ChevronLeftIcon,
@@ -22,6 +18,7 @@ import {
 	TooltipContent,
 	TooltipTrigger,
 } from "#/components/Tooltip/Tooltip";
+import { MessageScroller, useMessageScroller } from "#/vendor/message-scroller";
 
 import { ConversationItem } from "../ChatElements/Conversation";
 import { Message, MessageContent } from "../ChatElements/Message";
@@ -187,6 +184,17 @@ const ChatMessageItem = memo<{
 						isAwaitingFirstStreamChunk,
 					})
 				: undefined;
+		// Editing rebuilds the message from text + attachments and would
+		// drop workspace file references, so such messages are read-only.
+		const canEditUserMessage =
+			isUser &&
+			messageId !== undefined &&
+			Boolean(onEditUserMessage) &&
+			!displayState?.hasWorkspaceFileReferences;
+		const canJumpBetweenUserMessages =
+			isUser &&
+			Boolean(onJumpToUserMessage) &&
+			(prevUserMessageKey !== undefined || nextUserMessageKey !== undefined);
 		if (displayState?.shouldHide) {
 			return null;
 		}
@@ -286,7 +294,8 @@ const ChatMessageItem = memo<{
 				{displayState &&
 					!hideActions &&
 					(displayState.hasCopyableContent ||
-						(isUser && onEditUserMessage)) && (
+						canEditUserMessage ||
+						canJumpBetweenUserMessages) && (
 						<div
 							className={cn(
 								"mt-0.5 flex items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover/msg:opacity-100",
@@ -302,7 +311,7 @@ const ChatMessageItem = memo<{
 									tooltipSide="bottom"
 								/>
 							)}
-							{isUser && messageId !== undefined && onEditUserMessage && (
+							{canEditUserMessage && messageId !== undefined && (
 								<Tooltip>
 									<TooltipTrigger asChild>
 										<Button
@@ -311,9 +320,16 @@ const ChatMessageItem = memo<{
 											className="size-6"
 											aria-label="Edit message"
 											onClick={() => {
-												const { text, fileBlocks } =
+												const editablePayload =
 													getEditableUserMessagePayload(message);
-												onEditUserMessage(messageId, text, fileBlocks);
+												if (!editablePayload) {
+													return;
+												}
+												onEditUserMessage?.(
+													messageId,
+													editablePayload.text,
+													editablePayload.fileBlocks,
+												);
 											}}
 										>
 											<PencilIcon />
@@ -402,7 +418,7 @@ const ChatMessageItem = memo<{
 	},
 );
 
-interface ConversationTimelineProps {
+type ConversationTimelineProps = {
 	hasMoreMessages?: boolean;
 	chatStatus: TypesGen.ChatStatus | null;
 	organizationId: string | undefined;
@@ -429,7 +445,7 @@ interface ConversationTimelineProps {
 	showDesktopPreviews?: boolean;
 	hasActiveStream?: boolean;
 	isAwaitingFirstStreamChunk?: boolean;
-}
+};
 
 export const ConversationTimeline = memo<ConversationTimelineProps>(
 	({
@@ -656,10 +672,9 @@ export const ConversationTimeline = memo<ConversationTimelineProps>(
 				{renderRows.map((row, index) => {
 					const block = blockByFirstRow.get(index);
 					if (block) {
-						// Expansion is recorded on the block's durable member rows and its
-						// item key, so it survives the live-to-complete handoff and
-						// prepends. The live row is excluded so the choice does not carry
-						// into the next turn. The newest member's decision wins.
+						// Keyed on durable member rows and the item key, excluding the live
+						// row so the choice does not carry into the next turn; the newest
+						// member wins.
 						const memberKeys = block.rowIndices.flatMap((rowIndex) => {
 							const member = renderRows[rowIndex];
 							return member.type === "message" ? [member.key] : [];

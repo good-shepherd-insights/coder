@@ -13,7 +13,7 @@ import { PersonalInstructionsSettings } from "./components/PersonalInstructionsS
 import { SectionHeader } from "./components/SectionHeader";
 import { UserChatDebugLoggingSettings } from "./components/UserChatDebugLoggingSettings";
 
-export interface AgentSettingsGeneralPageViewProps {
+export type AgentSettingsGeneralPageViewProps = {
 	userPromptData: TypesGen.UserChatCustomPrompt | undefined;
 	onSaveUserPrompt: UseMutateFunction<
 		TypesGen.UserChatCustomPrompt,
@@ -32,7 +32,7 @@ export interface AgentSettingsGeneralPageViewProps {
 	>;
 	isSavingUserDebugLogging: boolean;
 	isSaveUserDebugLoggingError: boolean;
-}
+};
 
 export const AgentSettingsGeneralPageView: FC<
 	AgentSettingsGeneralPageViewProps
