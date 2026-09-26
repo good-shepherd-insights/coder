@@ -174,7 +174,7 @@ func TestExecuteLocalTools_ExecuteTaskRetry(t *testing.T) {
 			}),
 		// The agent returns the process the first attempt started.
 		conn.EXPECT().StartProcess(gomock.Any(), gomock.Any()).
-			DoAndReturn(recordStart(workspacesdk.StartProcessResponse{ID: processID, Started: true, AgeMs: 7000})),
+			DoAndReturn(recordStart(workspacesdk.StartProcessResponse{ID: processID, Started: true, RunAge: 7 * time.Second})),
 		conn.EXPECT().ProcessOutput(gomock.Any(), processID, &workspacesdk.ProcessOutputOptions{Wait: true}).
 			Return(workspacesdk.ProcessOutputResponse{ExitCode: &exitCode, Output: "PASS"}, nil),
 	)

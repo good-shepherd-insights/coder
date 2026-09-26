@@ -339,14 +339,14 @@ func waitForToolCallProcess(
 	timeout time.Duration,
 ) ExecuteResult {
 	waitStart := time.Now()
-	ageMs := max(resp.AgeMs, 0)
+	runAge := max(resp.RunAge, 0)
 	// With no time left, waitCtx has already expired and waitForProcess
 	// reads the process once.
-	waitCtx, cancel := context.WithTimeout(ctx, timeout-time.Duration(ageMs)*time.Millisecond)
+	waitCtx, cancel := context.WithTimeout(ctx, timeout-runAge)
 	defer cancel()
 	result := waitForProcess(waitCtx, ctx, conn, resp.ID, timeout)
 	// Time since the process started, as reported by the agent, plus this attempt's wait.
-	result.WallDurationMs = ageMs + time.Since(waitStart).Milliseconds()
+	result.WallDurationMs = (runAge + time.Since(waitStart)).Milliseconds()
 	return result
 }
 
