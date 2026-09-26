@@ -128,6 +128,45 @@ export const MockWorkingBlock: WorkingBlock = {
 	isPartial: false,
 };
 
+const workingStepMessages = (
+	id: number,
+	toolCallId: string,
+	output: string,
+	callAt: number,
+	resultAt: number,
+): TypesGen.ChatMessage[] => [
+	{
+		...MockChatMessage,
+		id,
+		role: "assistant",
+		created_at: workingFixtureTime(callAt),
+		content: [
+			{
+				type: "tool-call",
+				tool_call_id: toolCallId,
+				tool_name: "execute",
+				args: { command: `echo ${toolCallId}` },
+				created_at: workingFixtureTime(callAt),
+			},
+		],
+	},
+	{
+		...MockChatMessage,
+		id: id + 1,
+		role: "tool",
+		created_at: workingFixtureTime(resultAt),
+		content: [
+			{
+				type: "tool-result",
+				tool_call_id: toolCallId,
+				tool_name: "execute",
+				result: { output, exit_code: "0" },
+				created_at: workingFixtureTime(resultAt),
+			},
+		],
+	},
+];
+
 /**
  * One completed turn of two shell steps with part timestamps: prompt at 0s,
  * tool work from 1s to 13s, answer at 14s.
@@ -139,66 +178,8 @@ export const MockWorkingMessages: TypesGen.ChatMessage[] = [
 		created_at: workingFixtureTime(0),
 		content: [{ type: "text", text: "Inspect the workspace" }],
 	},
-	{
-		...MockChatMessage,
-		id: 2,
-		role: "assistant",
-		created_at: workingFixtureTime(1),
-		content: [
-			{
-				type: "tool-call",
-				tool_call_id: "first",
-				tool_name: "execute",
-				args: { command: "echo first" },
-				created_at: workingFixtureTime(1),
-			},
-		],
-	},
-	{
-		...MockChatMessage,
-		id: 3,
-		role: "tool",
-		created_at: workingFixtureTime(4),
-		content: [
-			{
-				type: "tool-result",
-				tool_call_id: "first",
-				tool_name: "execute",
-				result: { output: "First output", exit_code: "0" },
-				created_at: workingFixtureTime(4),
-			},
-		],
-	},
-	{
-		...MockChatMessage,
-		id: 4,
-		role: "assistant",
-		created_at: workingFixtureTime(5),
-		content: [
-			{
-				type: "tool-call",
-				tool_call_id: "second",
-				tool_name: "execute",
-				args: { command: "echo second" },
-				created_at: workingFixtureTime(5),
-			},
-		],
-	},
-	{
-		...MockChatMessage,
-		id: 5,
-		role: "tool",
-		created_at: workingFixtureTime(13),
-		content: [
-			{
-				type: "tool-result",
-				tool_call_id: "second",
-				tool_name: "execute",
-				result: { output: "Second output", exit_code: "0" },
-				created_at: workingFixtureTime(13),
-			},
-		],
-	},
+	...workingStepMessages(2, "first", "First output", 1, 4),
+	...workingStepMessages(4, "second", "Second output", 5, 13),
 	{
 		...MockChatMessage,
 		id: 6,
@@ -207,6 +188,23 @@ export const MockWorkingMessages: TypesGen.ChatMessage[] = [
 		content: [{ type: "text", text: "Workspace inspection complete." }],
 	},
 ];
+
+/** A question the agent asks after the first step of MockWorkingMessages. */
+export const MockQuestionCallMessage: TypesGen.ChatMessage = {
+	...MockChatMessage,
+	id: 4,
+	role: "assistant",
+	created_at: workingFixtureTime(5),
+	content: [
+		{
+			type: "tool-call",
+			tool_call_id: "question",
+			tool_name: "ask_user_question",
+			args: {},
+			created_at: workingFixtureTime(5),
+		},
+	],
+};
 
 export const buildReconnectState = (
 	overrides: Partial<ReconnectState> = {},
@@ -217,40 +215,14 @@ export const buildReconnectState = (
 	...overrides,
 });
 
-const longTurnStep = (index: number): TypesGen.ChatMessage[] => [
-	{
-		...MockChatMessage,
-		id: 100 + index * 2,
-		role: "assistant",
-		created_at: workingFixtureTime(index),
-		content: [
-			{
-				type: "tool-call",
-				tool_call_id: `step-${index}`,
-				tool_name: "execute",
-				args: { command: `echo step-${index}` },
-				created_at: workingFixtureTime(index),
-			},
-		],
-	},
-	{
-		...MockChatMessage,
-		id: 101 + index * 2,
-		role: "tool",
-		created_at: workingFixtureTime(index),
-		content: [
-			{
-				type: "tool-result",
-				tool_call_id: `step-${index}`,
-				tool_name: "execute",
-				result: { output: `step-${index}`, exit_code: "0" },
-				created_at: workingFixtureTime(index),
-			},
-		],
-	},
-];
 const MockLongTurn = Array.from({ length: 60 }, (_, index) =>
-	longTurnStep(index),
+	workingStepMessages(
+		100 + index * 2,
+		`step-${index}`,
+		`step-${index}`,
+		index,
+		index,
+	),
 ).flat();
 const MockLongTurnPrompt: TypesGen.ChatMessage = {
 	...MockChatMessage,
