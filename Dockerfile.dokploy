@@ -1,0 +1,34 @@
+# Builds Coder from source using the repo's own flake.nix, for deployment on
+# Dokploy (or any Docker-based host) via the "Dockerfile" build type.
+#
+# Stage 1 runs the actual Nix flake build (not Nixpacks/Railpack auto-detect,
+# which cannot reproduce this repo's pinned Go/sqlc/drpc/protobuf toolchain
+# or the pnpm2nix frontend build). `nix build .#default` resolves to the
+# binary matching whatever OS/arch this stage is running under, so the same
+# Dockerfile works unmodified on x86_64 or aarch64 build hosts.
+FROM nixos/nix:latest AS builder
+
+RUN mkdir -p /etc/nix && \
+    echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf && \
+    echo "sandbox = false" >> /etc/nix/nix.conf
+
+WORKDIR /src
+COPY . .
+
+RUN nix build .#default -L
+RUN cp -L result/bin/coder /coder
+
+# Stage 2: minimal runtime image, mirrors scripts/Dockerfile's pattern of
+# copying in a pre-built binary rather than building inside the final image.
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /coder /opt/coder
+RUN chmod 755 /opt/coder
+
+EXPOSE 3000
+
+ENTRYPOINT ["/opt/coder", "server"]

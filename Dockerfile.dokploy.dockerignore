@@ -1,0 +1,9 @@
+# Overrides the repo-root .dockerignore for builds using Dockerfile.dokploy.
+# The root .dockerignore is an allowlist scoped to coder's own dogfood image
+# builds and excludes nearly everything, including flake.nix — this file
+# takes precedence (per BuildKit's <dockerfile>.dockerignore rule) so the
+# Nix flake build actually gets its source.
+#
+# .git must stay in the build context: flake.nix reads
+# `self.shortRev or self.dirtyShortRev` for its version string, which Nix
+# can only populate when .git metadata is present in the source tree.
