@@ -90,7 +90,7 @@ func executeWriteFileTool(
 // request, live or recorded, into the tool result.
 func writeFileResult(err error) fantasy.ToolResponse {
 	if err != nil {
-		return fantasy.NewTextErrorResponse(err.Error())
+		return fantasy.NewTextErrorResponse(agentAPIErrorMessage(err))
 	}
 	return toolResponse(map[string]any{"ok": true})
 }

@@ -1486,19 +1486,11 @@ func TestInterruptTask_FileToolCallResults(t *testing.T) {
 	tests := []struct {
 		name    string
 		resp    workspacesdk.CancelToolCallResponse
-		err     error
 		dialErr error
-		// generic is set when the call keeps today's interrupted result.
-		generic bool
 		// wantOK is the successful result per tool. Otherwise the result
 		// is an error that contains every string in wantError.
 		wantOK    map[string]string
 		wantError []string
-		// onlyTool limits the case to one tool.
-		onlyTool string
-		// wantTruncated is set when the result must be cut to the default
-		// tool result budget, as generation cuts a live result.
-		wantTruncated bool
 	}{
 		{
 			name: "Applied",
@@ -1507,32 +1499,6 @@ func TestInterruptTask_FileToolCallResults(t *testing.T) {
 				chattool.EditFilesToolName: `{"ok":true,"files":[{"path":"/a.txt","diff":"-a\n+b"}]}`,
 				chattool.WriteFileToolName: `{"ok":true}`,
 			},
-		},
-		{
-			name:          "OversizedDiff",
-			resp:          recordedFileResponse(http.StatusOK, fmt.Sprintf(`{"files":[{"path":"/a.txt","diff":%q}]}`, strings.Repeat("+line\n", 20_000))),
-			onlyTool:      chattool.EditFilesToolName,
-			wantTruncated: true,
-		},
-		{
-			name:      "RecordedError",
-			resp:      recordedFileResponse(http.StatusBadRequest, `{"message":"edit /a.txt: no match"}`),
-			wantError: []string{"edit /a.txt: no match"},
-		},
-		{
-			// US10: the agent never received the request.
-			name:      "NotApplied",
-			wantError: []string{"not applied"},
-		},
-		{
-			name:    "OldAgentWithoutCancelRoute",
-			err:     codersdk.NewTestError(http.StatusNotFound, http.MethodPost, "/api/v0/tool-calls/x/cancel"),
-			generic: true,
-		},
-		{
-			name:      "Unreachable",
-			err:       agentTransportError(xerrors.New("connection reset by peer")),
-			wantError: []string{"outcome unknown", "could not be reached", "may have been applied"},
 		},
 		{
 			name:      "NoConnection",
@@ -1546,25 +1512,12 @@ func TestInterruptTask_FileToolCallResults(t *testing.T) {
 			dialErr:   chattool.ErrWorkspaceHasNoAgent,
 			wantError: []string{"outcome unknown", "start_workspace", "may have been applied"},
 		},
-		{
-			name:    "ChatHasNoWorkspace",
-			dialErr: chattool.ErrChatHasNoWorkspace,
-			generic: true,
-		},
-		{
-			name:    "WorkspaceDeleted",
-			dialErr: chattool.ErrWorkspaceDeleted,
-			generic: true,
-		},
 	}
 	for _, toolName := range fileToolNames {
 		t.Run(toolName, func(t *testing.T) {
 			t.Parallel()
 
 			for _, tc := range tests {
-				if tc.onlyTool != "" && tc.onlyTool != toolName {
-					continue
-				}
 				t.Run(tc.name, func(t *testing.T) {
 					t.Parallel()
 
@@ -1572,31 +1525,73 @@ func TestInterruptTask_FileToolCallResults(t *testing.T) {
 					callID := "call_" + uuid.NewString()
 					e := newExecuteInterrupt(t, f, []codersdk.ChatMessagePart{fileToolCall(toolName, callID)}, tc.dialErr)
 					if tc.dialErr == nil {
-						e.expectCancel(t, callID, workspacesdk.CancelToolCallRequest{}, tc.resp, tc.err)
+						e.expectCancel(t, callID, workspacesdk.CancelToolCallRequest{}, tc.resp, nil)
 					}
 
 					part := singleToolResult(t, e.interrupt(t, f), callID)
-					switch {
-					case tc.generic:
-						requireGenericInterruptResult(t, part)
-					case tc.wantTruncated:
-						// A cut JSON result is no longer JSON, so it is
-						// stored as output text, as for a live result.
-						require.False(t, part.IsError, string(part.Result))
-						var result struct {
-							Output string `json:"output"`
-						}
-						require.NoError(t, json.Unmarshal(part.Result, &result), string(part.Result))
-						assert.LessOrEqual(t, len(result.Output), 64<<10)
-						assert.Contains(t, result.Output, "Coder truncated")
-					case tc.wantOK != nil:
+					if tc.wantOK != nil {
 						require.False(t, part.IsError, string(part.Result))
 						assert.JSONEq(t, tc.wantOK[toolName], string(part.Result))
-					default:
-						requireFileToolErrorResult(t, part, tc.wantError...)
+						return
 					}
+					requireFileToolErrorResult(t, part, tc.wantError...)
 				})
 			}
+		})
+	}
+}
+
+// TestInterruptTask_ResultsTruncatedLikeLiveResults shows that interrupt
+// results are cut to the per-result budget generation derives from the
+// chat model's context window, so an interrupted edit_files call whose
+// recorded diff is megabytes long cannot overflow the next prompt. The
+// small window gets the 16KB floor rather than the 64KB default.
+func TestInterruptTask_ResultsTruncatedLikeLiveResults(t *testing.T) {
+	t.Parallel()
+
+	const budget = 16 << 10
+	tests := []struct {
+		name string
+		call func(callID string) codersdk.ChatMessagePart
+		req  workspacesdk.CancelToolCallRequest
+		resp workspacesdk.CancelToolCallResponse
+	}{
+		{
+			name: "OversizedDiff",
+			call: func(callID string) codersdk.ChatMessagePart { return fileToolCall(chattool.EditFilesToolName, callID) },
+			resp: recordedFileResponse(http.StatusOK, fmt.Sprintf(`{"files":[{"path":"/a.txt","diff":%q}]}`, strings.Repeat("+line\n", 200_000))),
+		},
+		{
+			name: "ExecuteOutput",
+			call: func(callID string) codersdk.ChatMessagePart { return executeToolCall(callID, executeForeground) },
+			req:  executeForegroundStop,
+			resp: workspacesdk.CancelToolCallResponse{Started: true, Process: &workspacesdk.ToolCallProcess{
+				Output: strings.Repeat("x", 30_000), ExitCode: new(0), RunAgeMs: 1_000,
+			}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newTaskTestFixture(t)
+			_, err := f.sqlDB.ExecContext(testutil.Context(t, testutil.WaitShort),
+				`UPDATE chat_model_configs SET context_limit = 1000 WHERE id = $1`, f.model.ID)
+			require.NoError(t, err)
+			callID := "call_" + uuid.NewString()
+			e := newExecuteInterrupt(t, f, []codersdk.ChatMessagePart{tc.call(callID)}, nil)
+			e.expectCancel(t, callID, tc.req, tc.resp, nil)
+
+			part := singleToolResult(t, e.interrupt(t, f), callID)
+			// A cut JSON result is no longer JSON, so it is stored as
+			// output text, as for a live result.
+			require.False(t, part.IsError, string(part.Result))
+			var result struct {
+				Output string `json:"output"`
+			}
+			require.NoError(t, json.Unmarshal(part.Result, &result), string(part.Result))
+			assert.LessOrEqual(t, len(result.Output), budget)
+			assert.Contains(t, result.Output, "Coder truncated")
 		})
 	}
 }

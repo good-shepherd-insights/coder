@@ -297,7 +297,7 @@ func TestInterruptFileToolCall(t *testing.T) {
 			wantIsError: true,
 			wantContent: map[string]string{
 				chattool.EditFilesToolName: "open /a.txt: file does not exist",
-				chattool.WriteFileToolName: "unexpected status code 404: open /a.txt: file does not exist",
+				chattool.WriteFileToolName: "open /a.txt: file does not exist",
 			},
 		},
 		{

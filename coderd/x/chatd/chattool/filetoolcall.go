@@ -29,20 +29,25 @@ func fileChange(toolName string) string {
 }
 
 // fileToolErrorWords are the words of the file tool toolName in the
-// results AgentErrorText builds.
+// unknown outcome results AgentErrorText builds.
 func fileToolErrorWords(toolName string) AgentErrorWords {
-	action, existing := "edit files", "an edit for this tool call"
-	if toolName == WriteFileToolName {
-		action, existing = "write file", "a write for this tool call"
-	}
 	change := fileChange(toolName)
 	return AgentErrorWords{
-		Action:          action,
-		Existing:        existing,
 		Effect:          "the " + change + " may have been applied",
 		Check:           checkFileText,
 		RestartedEffect: "the " + change + " may have been applied before the restart",
 	}
+}
+
+// fileRequestErrorWords are fileToolErrorWords plus the words of an
+// input_mismatch refusal, which only an edit or write request gets.
+func fileRequestErrorWords(toolName string) AgentErrorWords {
+	words := fileToolErrorWords(toolName)
+	words.Action, words.Existing = "edit files", "an edit for this tool call"
+	if toolName == WriteFileToolName {
+		words.Action, words.Existing = "write file", "a write for this tool call"
+	}
+	return words
 }
 
 // fileToolChangeLost reports whether err, from obtaining the workspace
@@ -77,7 +82,7 @@ func fileRequestErrorResult(ctx context.Context, toolName string, err error) (re
 	if _, ok := reportableToolCall(ctx); !ok {
 		return fantasy.ToolResponse{}, false
 	}
-	text, ok := AgentErrorText(err, fileToolErrorWords(toolName))
+	text, ok := AgentErrorText(err, fileRequestErrorWords(toolName))
 	if !ok {
 		return fantasy.ToolResponse{}, false
 	}
