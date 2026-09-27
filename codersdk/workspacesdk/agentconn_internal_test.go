@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	neturl "net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -163,7 +164,10 @@ func TestDoWithToolCall(t *testing.T) {
 
 		ctx := testutil.Context(t, testutil.WaitShort)
 		dialErr := xerrors.New("agent not reachable")
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, unreachableURL, nil)
+		// http.Client.Do closes the request body on every error; a failed
+		// dial before Do must too, or a file body leaks its descriptor.
+		body := &closeCountingReader{Reader: strings.NewReader("content")}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, unreachableURL, body)
 		require.NoError(t, err)
 
 		res, err := doWithToolCall(req, ToolCall{MessageID: 1, ID: "call"}, quartz.NewMock(t), func(context.Context) (net.Conn, error) {
@@ -179,6 +183,7 @@ func TestDoWithToolCall(t *testing.T) {
 		require.ErrorAs(t, err, &urlErr)
 		require.Equal(t, "Post", urlErr.Op)
 		require.Empty(t, req.Header.Values(CoderToolCallAgeMsHeader))
+		require.Equal(t, int32(1), body.closes.Load())
 	})
 
 	t.Run("unused connection is closed", func(t *testing.T) {
@@ -220,6 +225,17 @@ func TestDoWithToolCall(t *testing.T) {
 		_, err = io.Copy(io.Discard, server)
 		require.NoError(t, err)
 	})
+}
+
+// closeCountingReader counts calls to Close.
+type closeCountingReader struct {
+	io.Reader
+	closes atomic.Int32
+}
+
+func (r *closeCountingReader) Close() error {
+	r.closes.Add(1)
+	return nil
 }
 
 func TestRunAgeFromHeader(t *testing.T) {
