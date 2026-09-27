@@ -13,7 +13,9 @@ import (
 	"net/netip"
 	neturl "net/url"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,6 +32,7 @@ import (
 	"github.com/coder/coder/v2/codersdk/healthsdk"
 	"github.com/coder/coder/v2/codersdk/wsjson"
 	"github.com/coder/coder/v2/tailnet"
+	"github.com/coder/quartz"
 	"github.com/coder/websocket"
 )
 
@@ -1631,10 +1634,55 @@ func (c *agentConn) apiRequest(ctx context.Context, method, path string, body in
 		}
 	}
 	if tc, ok := ToolCallFromContext(ctx); ok {
-		tc.SetHeaders(req.Header)
+		return doWithToolCall(req, tc, quartz.NewReal(), func(ctx context.Context) (net.Conn, error) {
+			return c.dialAPI(ctx, host)
+		})
 	}
 
 	return c.apiClient(ctx).Do(req)
+}
+
+// doWithToolCall connects with dial before it sets tc's headers on req,
+// so the age header includes the time spent connecting, such as waiting
+// for a restarting agent to become reachable. It then sends req over
+// that connection.
+func doWithToolCall(req *http.Request, tc ToolCall, clock quartz.Clock, dial func(context.Context) (net.Conn, error)) (*http.Response, error) {
+	start := clock.Now()
+	conn, err := dial(req.Context())
+	if err != nil {
+		// Match what http.Client.Do returns for a failed dial, so callers
+		// classify it as a transport failure either way.
+		return nil, &neturl.Error{
+			Op:  req.Method[:1] + strings.ToLower(req.Method[1:]),
+			URL: req.URL.String(),
+			Err: err,
+		}
+	}
+	tc.Age += clock.Since(start)
+	tc.SetHeaders(req.Header)
+
+	// handedOut ensures conn goes either to the transport, once, or is
+	// closed here when the transport never asked for it.
+	var handedOut atomic.Bool
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			DialContext: func(context.Context, string, string) (net.Conn, error) {
+				if handedOut.Swap(true) {
+					return nil, xerrors.New("agent connection already used")
+				}
+				return conn, nil
+			},
+		},
+	}
+	res, err := client.Do(req)
+	if !handedOut.Swap(true) {
+		_ = conn.Close()
+	}
+	return res, err
 }
 
 // decodeAgentJSON decodes an agent-direct HTTP response body. Agent
@@ -1653,7 +1701,6 @@ func decodeAgentJSON(res *http.Response, v any) error {
 // scoped to a single request: its transport cancels in-flight dials
 // once reqCtx ends.
 func (c *agentConn) apiClient(reqCtx context.Context) *http.Client {
-	agentAddr := netip.AddrPortFrom(c.agentAddress(), AgentHTTPAPIServerPort)
 	return &http.Client{
 		// Redirects are blocked to prevent misuse.
 		CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -1668,22 +1715,6 @@ func (c *agentConn) apiClient(reqCtx context.Context) *http.Client {
 					return nil, xerrors.Errorf("network must be tcp")
 				}
 
-				host, port, err := net.SplitHostPort(addr)
-				if err != nil {
-					return nil, xerrors.Errorf("split host port %q: %w", addr, err)
-				}
-				if port != strconv.Itoa(AgentHTTPAPIServerPort) {
-					return nil, xerrors.Errorf("request %q does not appear to be for http api", addr)
-				}
-				if reqAddr, err := netip.ParseAddr(host); err != nil || reqAddr != agentAddr.Addr() {
-					c.opts.Logger.Warn(ctx, "blocked workspace agent API request to unintended host",
-						slog.F("agent_id", c.opts.AgentID),
-						slog.F("request_host", host),
-						slog.F("intended_agent_addr", agentAddr.Addr()),
-					)
-					return nil, xerrors.Errorf("request host %q does not match intended agent %q", host, agentAddr.Addr())
-				}
-
 				// http.Transport detaches ctx from the request context so
 				// a pending dial can outlive its request and serve future
 				// requests. This client is request-scoped with keep-alives
@@ -1696,20 +1727,43 @@ func (c *agentConn) apiClient(reqCtx context.Context) *http.Client {
 				stop := context.AfterFunc(reqCtx, cancel)
 				defer stop()
 
-				if !c.AwaitReachable(ctx) {
-					return nil, xerrors.Errorf("workspace agent not reachable in time: %v", ctx.Err())
-				}
-
-				// Always dial the pinned agent address, never the request host.
-				conn, err := c.DialContextTCP(ctx, agentAddr)
-				if err != nil {
-					return nil, xerrors.Errorf("dial http api: %w", err)
-				}
-
-				return conn, nil
+				return c.dialAPI(ctx, addr)
 			},
 		},
 	}
+}
+
+// dialAPI waits until the agent is reachable and connects to its HTTP API
+// server. addr must name the agent's API address; the connection always
+// goes to the pinned agent address, never to addr's host.
+func (c *agentConn) dialAPI(ctx context.Context, addr string) (net.Conn, error) {
+	agentAddr := netip.AddrPortFrom(c.agentAddress(), AgentHTTPAPIServerPort)
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, xerrors.Errorf("split host port %q: %w", addr, err)
+	}
+	if port != strconv.Itoa(AgentHTTPAPIServerPort) {
+		return nil, xerrors.Errorf("request %q does not appear to be for http api", addr)
+	}
+	if reqAddr, err := netip.ParseAddr(host); err != nil || reqAddr != agentAddr.Addr() {
+		c.opts.Logger.Warn(ctx, "blocked workspace agent API request to unintended host",
+			slog.F("agent_id", c.opts.AgentID),
+			slog.F("request_host", host),
+			slog.F("intended_agent_addr", agentAddr.Addr()),
+		)
+		return nil, xerrors.Errorf("request host %q does not match intended agent %q", host, agentAddr.Addr())
+	}
+
+	if !c.AwaitReachable(ctx) {
+		return nil, xerrors.Errorf("workspace agent not reachable in time: %v", ctx.Err())
+	}
+
+	// Always dial the pinned agent address, never the request host.
+	conn, err := c.DialContextTCP(ctx, agentAddr)
+	if err != nil {
+		return nil, xerrors.Errorf("dial http api: %w", err)
+	}
+	return conn, nil
 }
 
 func (c *agentConn) GetPeerDiagnostics() tailnet.PeerDiagnostics {
