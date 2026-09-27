@@ -107,14 +107,15 @@ func (s *Store) Current(key Key) bool {
 }
 
 // begin applies the decision rules to a request that runs the tool call.
-// It returns the existing record, or a new pending record (created) that
-// the caller must run and publish. Concurrent requests for key wait on the
-// pending record instead of running their own.
-func (s *Store) begin(key Key, age time.Duration, input [sha256.Size]byte) (rec *record, created bool, err error) {
+// receivedAt is when the request arrived on the store's clock. It returns
+// the existing record, or a new pending record (created) that the caller
+// must run and publish. Concurrent requests for key wait on the pending
+// record instead of running their own.
+func (s *Store) begin(key Key, receivedAt time.Time, age time.Duration, input [sha256.Size]byte) (rec *record, created bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rec, ok, err := s.lookup(key, age)
+	rec, ok, err := s.lookup(key, receivedAt, age)
 	if err != nil {
 		return nil, false, err
 	}
@@ -132,14 +133,15 @@ func (s *Store) begin(key Key, age time.Duration, input [sha256.Size]byte) (rec 
 	return rec, true, nil
 }
 
-// cancel applies the decision rules to a cancel. It returns the existing
-// record, which may be canceled or pending, or received=false after
-// recording a tool call the agent never received as canceled.
-func (s *Store) cancel(key Key, age time.Duration) (rec *record, received bool, err error) {
+// cancel applies the decision rules to a cancel that arrived at
+// receivedAt. It returns the existing record, which may be canceled or
+// pending, or received=false after recording a tool call the agent never
+// received as canceled.
+func (s *Store) cancel(key Key, receivedAt time.Time, age time.Duration) (rec *record, received bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rec, ok, err := s.lookup(key, age)
+	rec, ok, err := s.lookup(key, receivedAt, age)
 	if err != nil {
 		return nil, false, err
 	}
@@ -155,7 +157,7 @@ func (s *Store) cancel(key Key, age time.Duration) (rec *record, received bool, 
 // lookup returns the record for key, ok=false when the agent can prove it
 // never received the tool call, or the error that answers the request.
 // age is non-negative; a negative age counts as zero. s.mu must be held.
-func (s *Store) lookup(key Key, age time.Duration) (rec *record, ok bool, err error) {
+func (s *Store) lookup(key Key, receivedAt time.Time, age time.Duration) (rec *record, ok bool, err error) {
 	if chat, found := s.chats[key.ChatID]; found {
 		if key.MessageID < chat.latestMessageID {
 			return nil, false, errStaleToolCall
@@ -166,9 +168,12 @@ func (s *Store) lookup(key Key, age time.Duration) (rec *record, ok bool, err er
 	}
 	// Records from before agent start are lost, so an agent that started
 	// after the tool call was committed cannot tell whether an earlier
-	// agent received it. age comes from a request header and can be as
-	// large as the maximum Duration, so age+ageMargin could overflow.
-	if s.clock.Since(s.startedAt)-ageMargin <= max(age, 0) {
+	// agent received it. age was measured when the request was sent, so
+	// the uptime is taken when it arrived: reading a slow body would
+	// otherwise add to the uptime but not to age. age comes from a request
+	// header and can be as large as the maximum Duration, so
+	// age+ageMargin could overflow.
+	if receivedAt.Sub(s.startedAt)-ageMargin <= max(age, 0) {
 		return nil, false, errAgentStartedAfterToolCall
 	}
 	return nil, false, nil
