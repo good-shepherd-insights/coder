@@ -1576,6 +1576,12 @@ func TestAgent_ToolCalls(t *testing.T) {
 		_, err := conn.StartProcess(toolCall(1, id), workspacesdk.StartProcessRequest{Command: "sleep 60"})
 		require.NoError(t, err)
 	}
+	// Stop the process the cancel leaves running, so agent shutdown does
+	// not wait for its pipes. Cleanups run in reverse order, so the agent
+	// is still up.
+	t.Cleanup(func() {
+		assert.NoError(t, conn.SignalProcess(ctx, workspacesdk.ToolCallUUID(chatID, 1, "keep").String(), "kill"))
+	})
 	kept, err := cancelToolCall(1, "keep", 0)
 	require.NoError(t, err)
 	require.True(t, kept.Started)
