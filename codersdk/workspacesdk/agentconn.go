@@ -1693,6 +1693,11 @@ func doWithToolCall(req *http.Request, tc ToolCall, clock quartz.Clock, dial fun
 	start := clock.Now()
 	conn, err := dial(req.Context())
 	if err != nil {
+		// http.Client.Do closes the request body on every error, and a
+		// failed dial here never reaches Do.
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
 		// Match what http.Client.Do returns for a failed dial, so callers
 		// classify it as a transport failure either way.
 		return nil, &neturl.Error{
