@@ -404,18 +404,19 @@ func withToolCallHeaders(ctx context.Context) context.Context {
 // foreground process stops only while its run age is below the call's
 // effective timeout, so a process past its execute deadline keeps
 // running, as the timed out result with background_process_id promises.
-// A background process never stops. ok is false when the call keeps the
-// caller's generic interrupted result: the tool starts no process for
-// args, or the agent's answer does not describe the tool call (an error
-// answer, including the 404 of an agent without the cancel route).
-func InterruptExecute(ctx context.Context, conn workspacesdk.AgentConn, id ToolCallIdentity, args ExecuteArgs) (result ExecuteResult, ok bool) {
+// A background process never stops. The cancel request waits at most
+// AgentAnswerTimeout on clock (nil means a real clock). ok is false when
+// the call keeps the caller's generic interrupted result: the tool
+// starts no process for args, or the agent's answer does not describe
+// the tool call (an error answer, including the 404 of an agent without
+// the cancel route).
+func InterruptExecute(ctx context.Context, clock quartz.Clock, conn workspacesdk.AgentConn, id ToolCallIdentity, args ExecuteArgs) (result ExecuteResult, ok bool) {
 	stopAge, ok := args.InterruptStopRunAge()
 	if !ok {
 		return ExecuteResult{}, false
 	}
 	processID := id.UUID()
-	resp, err := conn.CancelToolCall(workspacesdk.WithToolCall(ctx, id.AgentToolCall()), processID,
-		workspacesdk.CancelToolCallRequest{StopIfRunAgeBelowMs: stopAge.Milliseconds()})
+	resp, err := cancelToolCall(ctx, clock, conn, id, stopAge)
 	if err != nil {
 		text, ok := AgentErrorText(err, interruptErrorWords(id, args))
 		return ExecuteResult{Error: text}, ok
@@ -459,6 +460,16 @@ func InterruptExecute(ctx context.Context, conn workspacesdk.AgentConn, id ToolC
 		result.WallDurationMs = proc.RunAgeMs
 		return result, true
 	}
+}
+
+// cancelToolCall cancels the tool call id with the stop run age
+// stopAge and waits at most AgentAnswerTimeout for the agent's answer.
+func cancelToolCall(ctx context.Context, clock quartz.Clock, conn workspacesdk.AgentConn, id ToolCallIdentity, stopAge time.Duration) (resp workspacesdk.CancelToolCallResponse, err error) {
+	err = AwaitAgentAnswer(workspacesdk.WithToolCall(ctx, id.AgentToolCall()), clock, func(ctx context.Context) error {
+		resp, err = conn.CancelToolCall(ctx, id.UUID(), workspacesdk.CancelToolCallRequest{StopIfRunAgeBelowMs: stopAge.Milliseconds()})
+		return err
+	})
+	return resp, err
 }
 
 // InterruptExecuteUnreachable returns the result of an execute call the
