@@ -16,6 +16,7 @@ import (
 	"github.com/coder/coder/v2/coderd/x/chatd/chattool"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/codersdk/workspacesdk"
+	"github.com/coder/coder/v2/testutil"
 	"github.com/coder/quartz"
 )
 
@@ -108,6 +109,13 @@ func TestClassifyAgentError(t *testing.T) {
 		{name: "Response", err: xerrors.Errorf("start: %w", codersdk.NewError(http.StatusNotFound, codersdk.Response{Message: "not found"})), wantKind: chattool.AgentErrorResponse},
 		{name: "Unreachable", err: xerrors.Errorf("do request: %w", &url.Error{Op: "Post", URL: "http://agent/api/v0/processes/start", Err: io.ErrUnexpectedEOF}), wantKind: chattool.AgentErrorUnreachable},
 		{name: "Unreadable", err: xerrors.New("decode response: unexpected EOF"), wantKind: chattool.AgentErrorUnreadable},
+		{
+			// The answer timeout also surfaces as a transport error; its
+			// cause tells it apart.
+			name:     "NoAnswer",
+			err:      xerrors.Errorf("%v: %w", &url.Error{Op: "Post", URL: "http://agent", Err: context.Canceled}, chattool.ErrAgentAnswerTimeout),
+			wantKind: chattool.AgentErrorNoAnswer,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -170,6 +178,10 @@ func TestAgentErrorText(t *testing.T) {
 			name: "Unreadable", err: unreadable, words: words, wantOK: true,
 			wantText: chattool.UnknownOutcome(chattool.AgentUnreadableReason(unreadable), words.Effect, words.Check),
 		},
+		{
+			name: "NoAnswer", err: xerrors.Errorf("start: %w", chattool.ErrAgentAnswerTimeout), words: words, wantOK: true,
+			wantText: chattool.UnknownOutcome(chattool.AgentNoAnswerReason, words.Effect, words.Check),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -178,6 +190,117 @@ func TestAgentErrorText(t *testing.T) {
 			text, ok := chattool.AgentErrorText(tt.err, tt.words)
 			assert.Equal(t, tt.wantOK, ok)
 			assert.Equal(t, tt.wantText, text)
+		})
+	}
+}
+
+func TestAwaitAgentAnswer(t *testing.T) {
+	t.Parallel()
+
+	errRefused := xerrors.New("connection refused")
+	// untilDone is an agent that never answers: its request ends only
+	// when the request context does, as the SDK reports it.
+	untilDone := func(ctx context.Context) error {
+		<-ctx.Done()
+		return xerrors.Errorf("do request: %w", ctx.Err())
+	}
+	tests := []struct {
+		name     string
+		nilClock bool
+		request  func(ctx context.Context) error
+		// end ends a request that is still waiting, by advancing the
+		// clock or by canceling the caller's context.
+		end   func(ctx context.Context, t *testing.T, clock *quartz.Mock, cancel context.CancelFunc, done <-chan error)
+		check func(t *testing.T, err error)
+	}{
+		{
+			name:    "Answered",
+			request: func(context.Context) error { return nil },
+			check:   func(t *testing.T, err error) { assert.NoError(t, err) },
+		},
+		{
+			name:     "AnsweredNilClock",
+			nilClock: true,
+			request:  func(context.Context) error { return nil },
+			check:    func(t *testing.T, err error) { assert.NoError(t, err) },
+		},
+		{
+			name:    "RequestError",
+			request: func(context.Context) error { return xerrors.Errorf("do request: %w", errRefused) },
+			check: func(t *testing.T, err error) {
+				assert.ErrorIs(t, err, errRefused)
+				assert.NotErrorIs(t, err, chattool.ErrAgentAnswerTimeout)
+			},
+		},
+		{
+			name:    "NoAnswer",
+			request: untilDone,
+			end: func(ctx context.Context, t *testing.T, clock *quartz.Mock, _ context.CancelFunc, done <-chan error) {
+				clock.Advance(chattool.AgentAnswerTimeout - time.Nanosecond).MustWait(ctx)
+				select {
+				case err := <-done:
+					t.Fatalf("request ended before the answer timeout: %v", err)
+				default:
+				}
+				clock.Advance(time.Nanosecond).MustWait(ctx)
+			},
+			check: func(t *testing.T, err error) {
+				assert.ErrorIs(t, err, chattool.ErrAgentAnswerTimeout)
+				// The request's own error stays in the text.
+				assert.Contains(t, err.Error(), "do request: context canceled")
+			},
+		},
+		{
+			name:    "CallerContextEnded",
+			request: untilDone,
+			end: func(_ context.Context, _ *testing.T, _ *quartz.Mock, cancel context.CancelFunc, _ <-chan error) {
+				cancel()
+			},
+			check: func(t *testing.T, err error) {
+				assert.ErrorIs(t, err, context.Canceled)
+				assert.NotErrorIs(t, err, chattool.ErrAgentAnswerTimeout)
+			},
+		},
+		{
+			// An answer that arrives as the timeout fires was received,
+			// so it is trusted.
+			name: "AnswerAfterTimeoutFired",
+			request: func(ctx context.Context) error {
+				<-ctx.Done()
+				return nil
+			},
+			end: func(ctx context.Context, _ *testing.T, clock *quartz.Mock, _ context.CancelFunc, _ <-chan error) {
+				clock.Advance(chattool.AgentAnswerTimeout).MustWait(ctx)
+			},
+			check: func(t *testing.T, err error) { assert.NoError(t, err) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			testCtx := testutil.Context(t, testutil.WaitShort)
+			callerCtx, cancel := context.WithCancel(testCtx)
+			defer cancel()
+			mock := quartz.NewMock(t)
+			trap := mock.Trap().AfterFunc("chattool", "agent-answer")
+			defer trap.Close()
+			var clock quartz.Clock = mock
+			if tt.nilClock {
+				clock = nil
+			}
+
+			done := make(chan error, 1)
+			go func() {
+				done <- chattool.AwaitAgentAnswer(callerCtx, clock, tt.request)
+			}()
+			if !tt.nilClock {
+				trap.MustWait(testCtx).MustRelease(testCtx)
+			}
+			if tt.end != nil {
+				tt.end(testCtx, t, mock, cancel, done)
+			}
+			tt.check(t, testutil.RequireReceive(testCtx, t, done))
 		})
 	}
 }

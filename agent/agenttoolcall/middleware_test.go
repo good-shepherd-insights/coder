@@ -454,6 +454,28 @@ func TestChatsAreIndependent(t *testing.T) {
 	assert.True(t, h.store.Current(agenttoolcall.Key{ChatID: chatB, MessageID: 1, ToolCallID: "call"}))
 }
 
+// A slow body advances the agent's uptime while the tool call age header
+// stays fixed, so the rule must use the time the request arrived.
+func TestMiddlewareAgentStartedAfterToolCallUsesArrivalTime(t *testing.T) {
+	t.Parallel()
+
+	next := &countingHandler{}
+	h := newHarness(t, 10*time.Second, next)
+	// At arrival the agent has run 10s, which with the margin cannot
+	// cover a 9s old tool call. Reading the body takes 5s more.
+	body := &clockAdvancingReader{clock: h.clock, advance: 5 * time.Second, data: "payload"}
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/start", body)
+	for k, v := range h.headers(1, "call", 9*time.Second) {
+		r.Header[k] = v
+	}
+	w := httptest.NewRecorder()
+	h.handler.ServeHTTP(w, r)
+
+	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+	assert.Equal(t, workspacesdk.ToolCallErrorAgentStartedAfterToolCall, decodeToolCallError(t, w).Code)
+	assert.Zero(t, next.calls.Load())
+}
+
 func TestMiddlewareDoneContext(t *testing.T) {
 	t.Parallel()
 
@@ -629,6 +651,29 @@ func TestMiddlewareDroppedPendingRecordWakesWaiters(t *testing.T) {
 		w := h.do(t.Context(), http.MethodPost, "/start", "", older)
 		assert.Equal(t, workspacesdk.ToolCallErrorStale, decodeToolCallError(t, w).Code)
 	})
+}
+
+// clockAdvancingReader advances clock by advance on its first read, as a
+// slow request body would, then returns data.
+type clockAdvancingReader struct {
+	clock    *quartz.Mock
+	advance  time.Duration
+	data     string
+	advanced bool
+	read     int
+}
+
+func (r *clockAdvancingReader) Read(p []byte) (int, error) {
+	if !r.advanced {
+		r.advanced = true
+		r.clock.Advance(r.advance)
+	}
+	if r.read >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.read:])
+	r.read += n
+	return n, nil
 }
 
 // harness serves requests through agentchat.Middleware and the store's

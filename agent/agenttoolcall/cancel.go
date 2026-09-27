@@ -31,6 +31,8 @@ type ProcessStopper interface {
 // processes.
 func (s *Store) CancelHandler(stopper ProcessStopper) http.HandlerFunc {
 	return func(rw http.ResponseWriter, r *http.Request) {
+		// Taken before the body is read; see lookup.
+		receivedAt := s.clock.Now()
 		ctx := r.Context()
 
 		key, age, present, badRequest := toolCallFromRequest(r)
@@ -55,7 +57,7 @@ func (s *Store) CancelHandler(stopper ProcessStopper) http.HandlerFunc {
 			return
 		}
 
-		rec, received, err := s.cancel(key, age)
+		rec, received, err := s.cancel(key, receivedAt, age)
 		if writeToolCallError(ctx, rw, err) {
 			return
 		}

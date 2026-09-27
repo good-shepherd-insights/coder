@@ -17,6 +17,7 @@ import (
 
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/codersdk/workspacesdk"
+	"github.com/coder/quartz"
 )
 
 const (
@@ -106,6 +107,9 @@ type ExecuteOptions struct {
 	// AGENT_BROWSER_SESSION so agent-browser CLI invocations land in a
 	// browser session scoped to this chat instead of a shared default.
 	AgentBrowserSession string
+	// Clock times the wait for the agent's answer to a start request
+	// (AgentAnswerTimeout). Nil means a real clock.
+	Clock quartz.Clock
 }
 
 // ProcessToolOptions configures a process management tool
@@ -239,9 +243,9 @@ func executeTool(
 	}
 
 	if background {
-		return executeBackground(ctx, conn, args.Command, workDir, env)
+		return executeBackground(ctx, conn, options.Clock, args.Command, workDir, env)
 	}
-	return executeForeground(ctx, conn, args, options.DefaultTimeout, workDir, env)
+	return executeForeground(ctx, conn, options.Clock, args, options.DefaultTimeout, workDir, env)
 }
 
 // executeBackground starts a process in the background and
@@ -249,11 +253,12 @@ func executeTool(
 func executeBackground(
 	ctx context.Context,
 	conn workspacesdk.AgentConn,
+	clock quartz.Clock,
 	command string,
 	workDir string,
 	env map[string]string,
 ) fantasy.ToolResponse {
-	resp, err := conn.StartProcess(withToolCallHeaders(ctx), workspacesdk.StartProcessRequest{
+	resp, err := startProcess(withToolCallHeaders(ctx), conn, clock, workspacesdk.StartProcessRequest{
 		Command:    command,
 		WorkDir:    workDir,
 		Env:        env,
@@ -285,6 +290,7 @@ func backgroundStartedResult(processID string) ExecuteResult {
 func executeForeground(
 	ctx context.Context,
 	conn workspacesdk.AgentConn,
+	clock quartz.Clock,
 	args ExecuteArgs,
 	optTimeout time.Duration,
 	workDir string,
@@ -300,7 +306,9 @@ func executeForeground(
 
 	start := time.Now()
 
-	resp, err := conn.StartProcess(withToolCallHeaders(cmdCtx), workspacesdk.StartProcessRequest{
+	// The start request ends at the execute timeout or the agent answer
+	// timeout, whichever comes first.
+	resp, err := startProcess(withToolCallHeaders(cmdCtx), conn, clock, workspacesdk.StartProcessRequest{
 		Command:    args.Command,
 		WorkDir:    workDir,
 		Env:        env,
@@ -338,6 +346,21 @@ func hasNoWorkspaceAgent(err error) bool {
 	return errors.Is(err, ErrChatHasNoWorkspace) ||
 		errors.Is(err, ErrWorkspaceDeleted) ||
 		errors.Is(err, ErrWorkspaceHasNoAgent)
+}
+
+// startProcess sends req and waits at most AgentAnswerTimeout for the
+// agent's answer.
+func startProcess(
+	ctx context.Context,
+	conn workspacesdk.AgentConn,
+	clock quartz.Clock,
+	req workspacesdk.StartProcessRequest,
+) (resp workspacesdk.StartProcessResponse, err error) {
+	err = AwaitAgentAnswer(ctx, clock, func(ctx context.Context) error {
+		resp, err = conn.StartProcess(ctx, req)
+		return err
+	})
+	return resp, err
 }
 
 // startErrorResult converts a StartProcess error into a result. ctx is
@@ -606,7 +629,11 @@ func waitForProcess(
 		if err != nil {
 			errMsg := fmt.Sprintf("get process output: %v; use process_output with ID %s to retry", origErr, processID)
 			if timedOut {
-				errMsg = fmt.Sprintf("command timed out after %s; failed to get output: %v", timeout, err)
+				// The wait may have been cut at the deadline after the
+				// process exited, so a timeout is not known.
+				errMsg = UnknownOutcome(fmt.Sprintf("the command's result was not received within %s (%v)", timeout, err),
+					"the command may still be running or may have finished",
+					fmt.Sprintf("Check it with process_output using process ID %s.", processID))
 			}
 			return ExecuteResult{
 				Success:             false,
