@@ -50,6 +50,8 @@ func FromContext(ctx context.Context) (ToolCall, bool) {
 // recorded request.
 func (s *Store) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		// Taken before the body is read; see lookup.
+		receivedAt := s.clock.Now()
 		ctx := r.Context()
 
 		key, age, present, badRequest := toolCallFromRequest(r)
@@ -71,7 +73,7 @@ func (s *Store) Middleware(next http.Handler) http.Handler {
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 
-		rec, created, err := s.begin(key, age, requestInput(r, body))
+		rec, created, err := s.begin(key, receivedAt, age, requestInput(r, body))
 		if writeToolCallError(ctx, rw, err) {
 			return
 		}

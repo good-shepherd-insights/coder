@@ -141,6 +141,27 @@ func TestCancelHandler(t *testing.T) {
 		assert.False(t, h.store.Current(h.key(1, "call")))
 	})
 
+	// The cancel handler reads its body before deciding, so a slow body
+	// must not make an unprovable tool call look new.
+	t.Run("AgentStartedAfterToolCallUsesArrivalTime", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t, 10*time.Second, &countingHandler{})
+		body := &clockAdvancingReader{clock: h.clock, advance: 5 * time.Second, data: `{}`}
+		router := chi.NewRouter()
+		router.Post("/tool-calls/{id}/cancel", h.store.CancelHandler(nil))
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, fmt.Sprintf("/tool-calls/%s/cancel", h.uuid(1, "call")), body)
+		for k, v := range h.headers(1, "call", 9*time.Second) {
+			r.Header[k] = v
+		}
+		w := httptest.NewRecorder()
+		agentchat.Middleware(router).ServeHTTP(w, r)
+
+		require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+		assert.Equal(t, workspacesdk.ToolCallErrorAgentStartedAfterToolCall, decodeToolCallError(t, w).Code)
+		assert.False(t, h.store.Current(h.key(1, "call")))
+	})
+
 	t.Run("NewerMessageDropsOlderRecords", func(t *testing.T) {
 		t.Parallel()
 
