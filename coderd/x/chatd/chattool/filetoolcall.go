@@ -20,18 +20,29 @@ const (
 // changed the file.
 const checkFileText = "Check the file before changing it again."
 
-// fileToolText holds the words a file tool's results use.
-type fileToolText struct {
-	// action names the request, change what it changes, and record a
-	// recorded change of this tool call.
-	action, change, record string
+// fileChange names what the file tool toolName changes.
+func fileChange(toolName string) string {
+	if toolName == WriteFileToolName {
+		return "write"
+	}
+	return "edit"
 }
 
-func fileToolTexts(toolName string) fileToolText {
+// fileToolErrorWords are the words of the file tool toolName in the
+// results AgentErrorText builds.
+func fileToolErrorWords(toolName string) AgentErrorWords {
+	action, existing := "edit files", "an edit for this tool call"
 	if toolName == WriteFileToolName {
-		return fileToolText{action: "write file", change: "write", record: "a write"}
+		action, existing = "write file", "a write for this tool call"
 	}
-	return fileToolText{action: "edit files", change: "edit", record: "an edit"}
+	change := fileChange(toolName)
+	return AgentErrorWords{
+		Action:          action,
+		Existing:        existing,
+		Effect:          "the " + change + " may have been applied",
+		Check:           checkFileText,
+		RestartedEffect: "the " + change + " may have been applied before the restart",
+	}
 }
 
 // fileToolChangeLost reports whether err, from obtaining the workspace
@@ -47,10 +58,9 @@ func fileToolChangeLost(err error) bool {
 // attempt of the tool call may have applied the change unless no change
 // can survive.
 func fileToolConnErrorResult(ctx context.Context, toolName string, err error) fantasy.ToolResponse {
-	if _, ok := ToolCallIdentityFromContext(ctx); ok && ctx.Err() == nil && !fileToolChangeLost(err) {
-		text := fileToolTexts(toolName)
+	if _, ok := reportableToolCall(ctx); ok && !fileToolChangeLost(err) {
 		return fantasy.NewTextErrorResponse(UnknownOutcome(AgentUnreachableReason(err),
-			"an earlier attempt may have applied the "+text.change, checkFileText))
+			"an earlier attempt may have applied the "+fileChange(toolName), checkFileText))
 	}
 	return fantasy.NewTextErrorResponse(err.Error())
 }
@@ -64,54 +74,52 @@ func fileRequestErrorResult(ctx context.Context, toolName string, err error) (re
 	if err == nil {
 		return fantasy.ToolResponse{}, false
 	}
-	text := fileToolTexts(toolName)
-	_, hasID := ToolCallIdentityFromContext(ctx)
-	kind, code := ClassifyAgentError(err)
-	switch {
-	case kind == AgentErrorRefused:
-		switch code {
-		case workspacesdk.ToolCallErrorAgentStartedAfterToolCall:
-			return agentRestartedFileResult(text), true
-		case workspacesdk.ToolCallErrorInputMismatch:
-			return fantasy.NewTextErrorResponse(fmt.Sprintf("%s: this request changed nothing because %s for this "+
-				"tool call already exists with a different input: %v", text.action, text.record, err)), true
-		default:
-			// stale_tool_call and tool_call_canceled reach only a stale
-			// attempt, whose commit fails the history version fence.
-			return fantasy.NewTextErrorResponse(fmt.Sprintf("%s: %v", text.action, err)), true
-		}
-	// A canceled ctx means the result will not be committed.
-	case !hasID || kind == AgentErrorResponse || ctx.Err() != nil:
+	if _, ok := reportableToolCall(ctx); !ok {
 		return fantasy.ToolResponse{}, false
-	case kind == AgentErrorUnreachable:
-		return fantasy.NewTextErrorResponse(UnknownOutcome(AgentUnreachableReason(err),
-			"the "+text.change+" may have been applied", checkFileText)), true
-	default:
-		return fantasy.NewTextErrorResponse(UnknownOutcome(AgentUnreadableReason(err),
-			"the "+text.change+" may have been applied", checkFileText)), true
 	}
+	text, ok := AgentErrorText(err, fileToolErrorWords(toolName))
+	if !ok {
+		return fantasy.ToolResponse{}, false
+	}
+	return fantasy.NewTextErrorResponse(text), true
 }
 
-// agentRestartedFileResult is the result of a file tool call the
-// workspace agent answered with agent_started_after_tool_call.
-func agentRestartedFileResult(text fileToolText) fantasy.ToolResponse {
-	return fantasy.NewTextErrorResponse(UnknownOutcome(AgentRestartedReason,
-		"the "+text.change+" may have been applied before the restart", checkFileText))
+// InterruptFileToolCall cancels an edit_files or write_file call, named
+// toolName, that the user interrupted and returns its result, built from
+// the workspace agent's answer. The agent cannot stop an edit in
+// progress, so it waits for it and answers with the recorded response,
+// which gives the result the tool returns for it. ok is false when the
+// call keeps the caller's generic interrupted result: the agent's answer
+// does not describe the tool call (an error answer, including the 404 of
+// an agent without the cancel route).
+func InterruptFileToolCall(ctx context.Context, conn workspacesdk.AgentConn, toolName string, id ToolCallIdentity) (result fantasy.ToolResponse, ok bool) {
+	// A zero stop run age never stops a process; file tools start none.
+	resp, err := conn.CancelToolCall(workspacesdk.WithToolCall(ctx, id.AgentToolCall()), id.UUID(),
+		workspacesdk.CancelToolCallRequest{StopIfRunAgeBelowMs: 0})
+	if err != nil {
+		text, ok := AgentErrorText(err, fileToolErrorWords(toolName))
+		return fantasy.NewTextErrorResponse(text), ok
+	}
+	if !resp.Started {
+		return fantasy.NewTextErrorResponse(fmt.Sprintf(
+			"not applied: the %s was canceled before the workspace agent received it.", fileChange(toolName))), true
+	}
+	if toolName == WriteFileToolName {
+		return writeFileResult(resp.WriteFileResult()), true
+	}
+	return editFilesResult(resp.EditFilesResult()), true
 }
 
-// FileToolCallConnErrorResult returns the result of an interrupted
-// edit_files or write_file call, named toolName, when no connection to
-// the workspace agent could be made to cancel it. ok is false when no
-// change can have survived, so the call keeps the generic interrupted
-// result.
-func FileToolCallConnErrorResult(toolName string, err error) (result fantasy.ToolResponse, ok bool) {
+// InterruptFileToolCallUnreachable returns the result of an edit_files or
+// write_file call, named toolName, that the user interrupted when no
+// connection to the workspace agent could be made. ok is false when the
+// call keeps the caller's generic interrupted result: no change can have
+// survived. A stopped workspace keeps its disk, so a call without a
+// workspace agent gets an unknown result.
+func InterruptFileToolCallUnreachable(toolName string, err error) (result fantasy.ToolResponse, ok bool) {
 	if fileToolChangeLost(err) {
 		return fantasy.ToolResponse{}, false
 	}
-	return agentUnreachableFileResult(fileToolTexts(toolName), err), true
-}
-
-func agentUnreachableFileResult(text fileToolText, err error) fantasy.ToolResponse {
-	return fantasy.NewTextErrorResponse(UnknownOutcome(AgentUnreachableReason(err),
-		"the "+text.change+" may have been applied", checkFileText))
+	words := fileToolErrorWords(toolName)
+	return fantasy.NewTextErrorResponse(UnknownOutcome(AgentUnreachableReason(err), words.Effect, words.Check)), true
 }

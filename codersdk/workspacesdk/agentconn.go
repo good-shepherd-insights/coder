@@ -976,6 +976,38 @@ type CancelToolCallResponse struct {
 	Process *ToolCallProcess `json:"process,omitempty"`
 }
 
+// EditFilesResult returns what EditFiles returned for the recorded
+// response of an edit_files tool call. Only valid when Started. An error
+// carries no request method or URL.
+func (r CancelToolCallResponse) EditFilesResult() (FileEditResponse, error) {
+	res := r.recordedResponse()
+	defer res.Body.Close()
+	return readEditFilesResponse(res)
+}
+
+// WriteFileResult returns what WriteFile returned for the recorded
+// response of a write_file tool call. Only valid when Started. An error
+// carries no request method or URL.
+func (r CancelToolCallResponse) WriteFileResult() error {
+	res := r.recordedResponse()
+	defer res.Body.Close()
+	return readWriteFileResponse(res)
+}
+
+// recordedResponse returns the recorded response as the HTTP response the
+// original request received, without the request.
+func (r CancelToolCallResponse) recordedResponse() *http.Response {
+	header := http.Header{}
+	if r.ContentType != "" {
+		header.Set("Content-Type", r.ContentType)
+	}
+	return &http.Response{
+		StatusCode: r.StatusCode,
+		Header:     header,
+		Body:       io.NopCloser(bytes.NewReader(r.Body)),
+	}
+}
+
 // ToolCallProcess is the state of the process a tool call started.
 type ToolCallProcess struct {
 	Running bool `json:"running"`

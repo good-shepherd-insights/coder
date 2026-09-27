@@ -79,11 +79,7 @@ func executeWriteFileTool(
 		}
 	}
 
-	writeCtx := ctx
-	if id, ok := ToolCallIdentityFromContext(ctx); ok {
-		writeCtx = workspacesdk.WithToolCall(ctx, id.AgentToolCall())
-	}
-	err := conn.WriteFile(writeCtx, requestedPath, strings.NewReader(args.Content))
+	err := conn.WriteFile(withToolCallHeaders(ctx), requestedPath, strings.NewReader(args.Content))
 	if result, ok := fileRequestErrorResult(ctx, WriteFileToolName, err); ok {
 		return result, nil
 	}

@@ -20,6 +20,7 @@ import (
 	"go.uber.org/goleak"
 	"tailscale.com/tailcfg"
 
+	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/codersdk/workspacesdk"
 	"github.com/coder/coder/v2/tailnet"
 	"github.com/coder/coder/v2/tailnet/proto"
@@ -309,6 +310,122 @@ func TestAgentConnToolCallRequests(t *testing.T) {
 	assert.Equal(t, []string{"connection-wide"}, got.header.Values(workspacesdk.CoderToolCallIDHeader))
 	assert.Empty(t, got.header.Values(workspacesdk.CoderToolCallMessageIDHeader))
 	assert.Empty(t, got.header.Values(workspacesdk.CoderToolCallAgeMsHeader))
+}
+
+// TestAgentConnFileToolCallResults verifies that EditFiles and WriteFile
+// decode a coded 409, and that a cancel answer carrying the recorded
+// response of an edit or write rebuilds what the original call returned.
+func TestAgentConnFileToolCallResults(t *testing.T) {
+	t.Parallel()
+
+	ctx := testutil.Context(t, testutil.WaitMedium)
+	derpMap, _ := tailnettest.RunDERPAndSTUN(t)
+
+	clientID := uuid.New()
+	agentID := uuid.New()
+	clientConn, _ := newTailnetConn(t, derpMap, clientID, "client")
+	agentTailnet, agentIP := newTailnetConn(t, derpMap, agentID, "agent")
+	stitchTailnet(t, map[uuid.UUID]*tailnet.Conn{
+		clientID: clientConn,
+		agentID:  agentTailnet,
+	})
+
+	// recorded is a response the fake agent gives, selected by the tool
+	// call ID of the request.
+	type recorded struct {
+		status      int
+		contentType string
+		body        string
+	}
+	tests := []struct {
+		name  string
+		edit  bool
+		agent recorded
+	}{
+		{name: "EditApplied", edit: true, agent: recorded{http.StatusOK, "application/json", `{"files":[{"path":"/a","diff":"@@ -1 +1 @@"}]}`}},
+		{name: "EditFailed", edit: true, agent: recorded{http.StatusBadRequest, "application/json", `{"message":"edit /a: no match","detail":"hint"}`}},
+		{name: "EditNotJSON", edit: true, agent: recorded{http.StatusBadGateway, "text/plain", "bad gateway"}},
+		{name: "WriteApplied", agent: recorded{http.StatusOK, "application/json", `{"message":"Successfully wrote to \"/a\""}`}},
+		{name: "WriteFailed", agent: recorded{http.StatusForbidden, "application/json", `{"message":"open /a: permission denied"}`}},
+		{name: "WriteNotJSON", agent: recorded{http.StatusBadGateway, "text/plain", "bad gateway"}},
+	}
+	byID := make(map[string]recorded, len(tests))
+	for _, tt := range tests {
+		byID[tt.name] = tt.agent
+	}
+	apply := func(rw http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get(workspacesdk.CoderToolCallIDHeader)
+		if id == "stale" {
+			rw.Header().Set("Content-Type", "application/json")
+			rw.WriteHeader(http.StatusConflict)
+			_, _ = rw.Write([]byte(`{"code":"stale_tool_call","message":"Stale."}`))
+			return
+		}
+		rec := byID[id]
+		rw.Header().Set("Content-Type", rec.contentType)
+		rw.WriteHeader(rec.status)
+		_, _ = rw.Write([]byte(rec.body))
+	}
+	router := http.NewServeMux()
+	router.HandleFunc("POST /api/v0/edit-files", apply)
+	router.HandleFunc("POST /api/v0/write-file", apply)
+	serveTailnetHTTP(t, agentTailnet, router)
+	require.True(t, clientConn.AwaitReachable(ctx, agentIP))
+
+	conn := workspacesdk.NewAgentConn(clientConn, workspacesdk.AgentConnOptions{AgentID: agentID})
+	conn.SetExtraHeaders(http.Header{workspacesdk.CoderChatIDHeader: {uuid.NewString()}})
+
+	t.Run("Stale", func(t *testing.T) {
+		t.Parallel()
+
+		staleCtx := workspacesdk.WithToolCall(testutil.Context(t, testutil.WaitShort), workspacesdk.ToolCall{MessageID: 1, ID: "stale"})
+		_, editErr := conn.EditFiles(staleCtx, workspacesdk.FileEditRequest{})
+		writeErr := conn.WriteFile(staleCtx, "/a", strings.NewReader("content"))
+		for _, err := range []error{editErr, writeErr} {
+			var tcErr *workspacesdk.ToolCallError
+			require.ErrorAs(t, err, &tcErr)
+			assert.Equal(t, workspacesdk.ToolCallErrorStale, tcErr.Code)
+		}
+	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tcCtx := workspacesdk.WithToolCall(testutil.Context(t, testutil.WaitShort), workspacesdk.ToolCall{MessageID: 1, ID: tt.name})
+			canceled := workspacesdk.CancelToolCallResponse{
+				Started:     true,
+				StatusCode:  tt.agent.status,
+				ContentType: tt.agent.contentType,
+				Body:        []byte(tt.agent.body),
+			}
+			var wantErr, gotErr error
+			if tt.edit {
+				var wantResp, gotResp workspacesdk.FileEditResponse
+				wantResp, wantErr = conn.EditFiles(tcCtx, workspacesdk.FileEditRequest{})
+				gotResp, gotErr = canceled.EditFilesResult()
+				assert.Equal(t, wantResp, gotResp)
+			} else {
+				wantErr = conn.WriteFile(tcCtx, "/a", strings.NewReader("content"))
+				gotErr = canceled.WriteFileResult()
+			}
+			if tt.agent.status == http.StatusOK {
+				require.NoError(t, wantErr)
+				require.NoError(t, gotErr)
+				return
+			}
+			// The rebuilt error is the original one without the request
+			// method and URL, which the recorded response does not have.
+			var wantSDK, gotSDK *codersdk.Error
+			require.ErrorAs(t, wantErr, &wantSDK)
+			require.ErrorAs(t, gotErr, &gotSDK)
+			assert.Equal(t, wantSDK.StatusCode(), gotSDK.StatusCode())
+			assert.Equal(t, wantSDK.Response, gotSDK.Response)
+			assert.Equal(t, wantSDK.Helper, gotSDK.Helper)
+			assert.Empty(t, gotSDK.Method())
+			assert.Empty(t, gotSDK.URL())
+			assert.Equal(t, wantErr.Error(), fmt.Sprintf("%s %s: %s", wantSDK.Method(), wantSDK.URL(), gotErr.Error()))
+		})
+	}
 }
 
 func newTailnetConn(t *testing.T, derpMap *tailcfg.DERPMap, id uuid.UUID, name string) (*tailnet.Conn, netip.Addr) {

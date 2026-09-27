@@ -114,11 +114,7 @@ func executeEditFilesTool(
 		}
 	}
 
-	editCtx := ctx
-	if id, ok := ToolCallIdentityFromContext(ctx); ok {
-		editCtx = workspacesdk.WithToolCall(ctx, id.AgentToolCall())
-	}
-	resp, err := conn.EditFiles(editCtx, workspacesdk.FileEditRequest{
+	resp, err := conn.EditFiles(withToolCallHeaders(ctx), workspacesdk.FileEditRequest{
 		Files:       args.Files,
 		IncludeDiff: true,
 	})

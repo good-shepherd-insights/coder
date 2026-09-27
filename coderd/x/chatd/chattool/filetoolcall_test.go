@@ -255,7 +255,141 @@ func TestWriteFileToolCall(t *testing.T) {
 	}
 }
 
-func TestFileToolCallConnErrorResult(t *testing.T) {
+// TestInterruptFileToolCall covers the result an interrupted edit_files
+// or write_file call gets from the workspace agent's answer to cancel.
+func TestInterruptFileToolCall(t *testing.T) {
+	t.Parallel()
+
+	transportErr := &url.Error{Op: http.MethodPost, URL: "http://agent/api/v0/tool-calls/x/cancel", Err: xerrors.New("connection reset by peer")}
+	tests := []struct {
+		name string
+		resp workspacesdk.CancelToolCallResponse
+		err  error
+		// generic is set when the call keeps today's interrupted result.
+		generic     bool
+		wantIsError bool
+		// wantContent is the whole result per tool, and wantContains lists
+		// substrings of it.
+		wantContent  map[string]string
+		wantContains []string
+	}{
+		{
+			name: "Applied",
+			resp: workspacesdk.CancelToolCallResponse{
+				Started:     true,
+				StatusCode:  http.StatusOK,
+				ContentType: "application/json",
+				Body:        []byte(`{"files":[{"path":"/a.txt","diff":"@@ -1 +1 @@"}]}`),
+			},
+			wantContent: map[string]string{
+				chattool.EditFilesToolName: `{"files":[{"path":"/a.txt","diff":"@@ -1 +1 @@"}],"ok":true}`,
+				chattool.WriteFileToolName: `{"ok":true}`,
+			},
+		},
+		{
+			name: "RecordedError",
+			resp: workspacesdk.CancelToolCallResponse{
+				Started:     true,
+				StatusCode:  http.StatusNotFound,
+				ContentType: "application/json",
+				Body:        []byte(`{"message":"open /a.txt: file does not exist"}`),
+			},
+			wantIsError: true,
+			wantContent: map[string]string{
+				chattool.EditFilesToolName: "open /a.txt: file does not exist",
+				chattool.WriteFileToolName: "unexpected status code 404: open /a.txt: file does not exist",
+			},
+		},
+		{
+			// US10: the agent proves it never received the request.
+			name:        "NotStarted",
+			wantIsError: true,
+			wantContent: map[string]string{
+				chattool.EditFilesToolName: "not applied: the edit was canceled before the workspace agent received it.",
+				chattool.WriteFileToolName: "not applied: the write was canceled before the workspace agent received it.",
+			},
+		},
+		{
+			name:         "AgentStartedAfterToolCall",
+			err:          &workspacesdk.ToolCallError{Response: codersdk.Response{Message: "refused"}, Code: workspacesdk.ToolCallErrorAgentStartedAfterToolCall},
+			wantIsError:  true,
+			wantContains: []string{"outcome unknown", "workspace agent restarted after this tool call", "may have been applied before the restart", "Check the file"},
+		},
+		{
+			name:    "StaleToolCall",
+			err:     &workspacesdk.ToolCallError{Response: codersdk.Response{Message: "stale"}, Code: workspacesdk.ToolCallErrorStale},
+			generic: true,
+		},
+		{
+			name:    "OldAgentWithoutCancelRoute",
+			err:     codersdk.NewTestError(http.StatusNotFound, http.MethodPost, "/api/v0/tool-calls/x/cancel"),
+			generic: true,
+		},
+		{
+			name:         "Unreachable",
+			err:          transportErr,
+			wantIsError:  true,
+			wantContains: []string{"outcome unknown", "could not be reached", "may have been applied", "connection reset by peer", "Check the file"},
+		},
+		{
+			name:         "UnreadableAnswer",
+			err:          xerrors.New("unexpected EOF"),
+			wantIsError:  true,
+			wantContains: []string{"outcome unknown", "answer could not be read", "may have been applied", "unexpected EOF"},
+		},
+	}
+	for _, toolName := range []string{chattool.EditFilesToolName, chattool.WriteFileToolName} {
+		t.Run(toolName, func(t *testing.T) {
+			t.Parallel()
+
+			for _, tc := range tests {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Parallel()
+
+					dbNow := time.Now()
+					id := chattool.ToolCallIdentity{
+						ChatID:     uuid.New(),
+						MessageID:  42,
+						ToolCallID: "call_" + uuid.NewString(),
+						Age:        chattool.NewToolCallAge(quartz.NewMock(t), dbNow, dbNow.Add(-time.Minute)),
+					}
+					mockConn := agentconnmock.NewMockAgentConn(gomock.NewController(t))
+					// File tools have no process to stop.
+					mockConn.EXPECT().CancelToolCall(gomock.Any(), id.UUID(), workspacesdk.CancelToolCallRequest{}).
+						DoAndReturn(func(ctx context.Context, _ string, _ workspacesdk.CancelToolCallRequest) (workspacesdk.CancelToolCallResponse, error) {
+							got, ok := workspacesdk.ToolCallFromContext(ctx)
+							assert.True(t, ok, "cancel request must carry the tool call")
+							assert.Equal(t, workspacesdk.ToolCall{MessageID: 42, ID: id.ToolCallID, Age: time.Minute}, got)
+							return tc.resp, tc.err
+						})
+
+					resp, ok := chattool.InterruptFileToolCall(context.Background(), mockConn, toolName, id)
+					if tc.generic {
+						assert.False(t, ok)
+						return
+					}
+					require.True(t, ok)
+					assert.Equal(t, tc.wantIsError, resp.IsError, resp.Content)
+					if want, ok := tc.wantContent[toolName]; ok {
+						if tc.wantIsError {
+							assert.Equal(t, want, resp.Content)
+						} else {
+							assert.JSONEq(t, want, resp.Content)
+						}
+					}
+					for _, want := range tc.wantContains {
+						assert.Contains(t, resp.Content, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestInterruptFileToolCallUnreachable covers the result of an
+// interrupted file tool call when no connection to the workspace agent
+// could be made.
+func TestInterruptFileToolCallUnreachable(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -265,6 +399,7 @@ func TestFileToolCallConnErrorResult(t *testing.T) {
 		wantContent []string
 	}{
 		{name: "DialFailed", err: xerrors.New("dial failed"), wantOK: true, wantContent: []string{"outcome unknown", "could not be reached", "may have been applied", "dial failed", "Check the file"}},
+		// A stopped workspace keeps its disk, so the change may be there.
 		{name: "NoAgent", err: chattool.ErrWorkspaceHasNoAgent, wantOK: true, wantContent: []string{"outcome unknown", "start_workspace", "may have been applied"}},
 		{name: "NoWorkspace", err: chattool.ErrChatHasNoWorkspace},
 		{name: "WorkspaceDeleted", err: chattool.ErrWorkspaceDeleted},
@@ -274,7 +409,7 @@ func TestFileToolCallConnErrorResult(t *testing.T) {
 			t.Run(toolName+"/"+tt.name, func(t *testing.T) {
 				t.Parallel()
 
-				resp, ok := chattool.FileToolCallConnErrorResult(toolName, tt.err)
+				resp, ok := chattool.InterruptFileToolCallUnreachable(toolName, tt.err)
 				require.Equal(t, tt.wantOK, ok)
 				if !ok {
 					return

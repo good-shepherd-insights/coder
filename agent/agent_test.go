@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -1510,6 +1511,110 @@ func TestAgent_SCP(t *testing.T) {
 	// Close the client to trigger disconnect event.
 	scpClient.Close()
 	assertConnectionReport(t, agentClient, proto.Connection_SSH, 0, "")
+}
+
+// TestAgent_ToolCalls sends tool call requests through a real AgentConn,
+// so they pass the agent's router and agentchat.Middleware: a repeated
+// start returns the first process, the one cancel route answers for a
+// process and an edit and applies the run-age rule, and a stale request
+// comes back as a coded 409.
+func TestAgent_ToolCalls(t *testing.T) {
+	t.Parallel()
+
+	//nolint:dogsled
+	conn, _, _, fs, _ := setupAgent(t, agentsdk.Manifest{}, 0)
+	ctx := testutil.Context(t, testutil.WaitLong)
+	chatID := uuid.New()
+	conn.SetExtraHeaders(http.Header{workspacesdk.CoderChatIDHeader: {chatID.String()}})
+	// toolCall returns the context of one request for a tool call. Each
+	// request has its own deadline, so a request that never gets an answer
+	// fails without holding the test context.
+	toolCall := func(messageID int64, id string) context.Context {
+		reqCtx, cancel := context.WithTimeout(ctx, testutil.WaitShort)
+		t.Cleanup(cancel)
+		return workspacesdk.WithToolCall(reqCtx, workspacesdk.ToolCall{MessageID: messageID, ID: id})
+	}
+	cancelToolCall := func(messageID int64, id string, stopBelow time.Duration) (workspacesdk.CancelToolCallResponse, error) {
+		return conn.CancelToolCall(toolCall(messageID, id), workspacesdk.ToolCallUUID(chatID, messageID, id).String(),
+			workspacesdk.CancelToolCallRequest{StopIfRunAgeBelowMs: stopBelow.Milliseconds()})
+	}
+
+	// The agent refuses tool calls committed up to a margin before it
+	// started, and a tool call age is never below zero, so wait until the
+	// agent has run past the margin. A refused cancel records nothing. The
+	// wait uses real time because agent.Options.Clock also drives the git,
+	// desktop, and context manager timers, which a mock clock would stall
+	// or fire all at once.
+	probeID := workspacesdk.ToolCallUUID(chatID, 1, "probe").String()
+	var probeErr error
+	require.Eventually(t, func() bool {
+		// A probe that gets no answer is retried rather than left to
+		// hold the wait.
+		probeCtx, cancel := context.WithTimeout(ctx, testutil.IntervalSlow)
+		defer cancel()
+		_, probeErr = conn.CancelToolCall(workspacesdk.WithToolCall(probeCtx, workspacesdk.ToolCall{MessageID: 1, ID: "probe"}), probeID, workspacesdk.CancelToolCallRequest{})
+		var tcErr *workspacesdk.ToolCallError
+		if errors.As(probeErr, &tcErr) && tcErr.Code == workspacesdk.ToolCallErrorAgentStartedAfterToolCall {
+			return false
+		}
+		// A deadline hit while reading the answer is not a *url.Error.
+		var urlErr *neturl.Error
+		return !errors.As(probeErr, &urlErr) && probeCtx.Err() == nil
+	}, testutil.WaitMedium, testutil.IntervalMedium)
+	require.NoError(t, probeErr)
+
+	processID := workspacesdk.ToolCallUUID(chatID, 1, "execute").String()
+	for range 2 {
+		resp, err := conn.StartProcess(toolCall(1, "execute"), workspacesdk.StartProcessRequest{Command: "echo tool-call"})
+		require.NoError(t, err)
+		require.Equal(t, processID, resp.ID, "every start for the tool call returns its process")
+	}
+
+	// A cancel stops a process only while its run age is below the
+	// threshold; 0 never stops.
+	for _, id := range []string{"keep", "stop"} {
+		_, err := conn.StartProcess(toolCall(1, id), workspacesdk.StartProcessRequest{Command: "sleep 60"})
+		require.NoError(t, err)
+	}
+	kept, err := cancelToolCall(1, "keep", 0)
+	require.NoError(t, err)
+	require.True(t, kept.Started)
+	require.NotNil(t, kept.Process)
+	assert.True(t, kept.Process.Running)
+	assert.False(t, kept.Process.Canceled)
+	stopped, err := cancelToolCall(1, "stop", time.Hour)
+	require.NoError(t, err)
+	require.True(t, stopped.Started)
+	require.NotNil(t, stopped.Process)
+	assert.False(t, stopped.Process.Running)
+	assert.True(t, stopped.Process.Canceled)
+
+	filePath := filepath.Join(os.TempDir(), "tool-call.txt")
+	require.NoError(t, afero.WriteFile(fs, filePath, []byte("one\n"), 0o644))
+	edits := workspacesdk.FileEditRequest{
+		Files:       []workspacesdk.FileEdits{{Path: filePath, Edits: []workspacesdk.FileEdit{{OldText: "one", NewText: "two"}}}},
+		IncludeDiff: true,
+	}
+	edited, err := conn.EditFiles(toolCall(1, "edit"), edits)
+	require.NoError(t, err)
+	canceledEdit, err := cancelToolCall(1, "edit", 0)
+	require.NoError(t, err)
+	require.True(t, canceledEdit.Started)
+	assert.Nil(t, canceledEdit.Process)
+	recorded, err := canceledEdit.EditFilesResult()
+	require.NoError(t, err)
+	assert.Equal(t, edited, recorded)
+
+	// A tool call in message 2 makes message 1 stale for every tool.
+	_, err = cancelToolCall(2, "newer", 0)
+	require.NoError(t, err)
+	_, err = conn.EditFiles(toolCall(1, "late"), edits)
+	var tcErr *workspacesdk.ToolCallError
+	require.ErrorAs(t, err, &tcErr)
+	assert.Equal(t, workspacesdk.ToolCallErrorStale, tcErr.Code)
+	data, err := afero.ReadFile(fs, filePath)
+	require.NoError(t, err)
+	assert.Equal(t, "two\n", string(data), "the stale edit changed nothing")
 }
 
 func TestAgent_FileTransferBlocked(t *testing.T) {
