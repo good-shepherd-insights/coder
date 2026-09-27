@@ -7,12 +7,16 @@ import (
 	"charm.land/fantasy"
 
 	"github.com/coder/coder/v2/codersdk/workspacesdk"
+	"github.com/coder/quartz"
 )
 
 type WriteFileOptions struct {
 	GetWorkspaceConn func(context.Context) (workspacesdk.AgentConn, error)
 	ResolvePlanPath  func(context.Context) (chatPath string, home string, err error)
 	IsPlanTurn       bool
+	// Clock times the wait for the agent's answer to the request
+	// (AgentAnswerTimeout). Nil means a real clock.
+	Clock quartz.Clock
 }
 
 type WriteFileArgs struct {
@@ -51,7 +55,7 @@ func WriteFile(options WriteFileOptions) fantasy.AgentTool {
 					return fantasy.NewTextErrorResponse(err.Error()), nil
 				}
 			}
-			return executeWriteFileTool(ctx, conn, args, options.ResolvePlanPath)
+			return executeWriteFileTool(ctx, conn, options.Clock, args, options.ResolvePlanPath)
 		},
 	)
 }
@@ -59,6 +63,7 @@ func WriteFile(options WriteFileOptions) fantasy.AgentTool {
 func executeWriteFileTool(
 	ctx context.Context,
 	conn workspacesdk.AgentConn,
+	clock quartz.Clock,
 	args WriteFileArgs,
 	resolvePlanPath func(context.Context) (chatPath string, home string, err error),
 ) (fantasy.ToolResponse, error) {
@@ -81,7 +86,9 @@ func executeWriteFileTool(
 		}
 	}
 
-	err := conn.WriteFile(withToolCallHeaders(ctx), requestedPath, strings.NewReader(args.Content))
+	err := AwaitAgentAnswer(withToolCallHeaders(ctx), clock, func(ctx context.Context) error {
+		return conn.WriteFile(ctx, requestedPath, strings.NewReader(args.Content))
+	})
 	if result, ok := fileRequestErrorResult(ctx, WriteFileToolName, err); ok {
 		return result, nil
 	}

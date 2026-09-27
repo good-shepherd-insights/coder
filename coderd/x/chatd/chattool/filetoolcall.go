@@ -8,6 +8,7 @@ import (
 	"charm.land/fantasy"
 
 	"github.com/coder/coder/v2/codersdk/workspacesdk"
+	"github.com/coder/quartz"
 )
 
 // Registered names of the file tools that send tool call headers.
@@ -16,9 +17,11 @@ const (
 	WriteFileToolName = "write_file"
 )
 
-// checkFileText tells the model how to learn whether a file tool call
-// changed the file.
-const checkFileText = "Check the file before changing it again."
+// checkFileText tells the model how to learn whether the file tool call
+// id changed the file.
+func checkFileText(id ToolCallIdentity) string {
+	return fmt.Sprintf("Check the file before changing it again (tool call %s).", id.UUID())
+}
 
 // fileChange names what the file tool toolName changes.
 func fileChange(toolName string) string {
@@ -28,21 +31,21 @@ func fileChange(toolName string) string {
 	return "edit"
 }
 
-// fileToolErrorWords are the words of the file tool toolName in the
-// unknown outcome results AgentErrorText builds.
-func fileToolErrorWords(toolName string) AgentErrorWords {
+// fileToolErrorWords are the words of the call id of the file tool
+// toolName in the unknown outcome results AgentErrorText builds.
+func fileToolErrorWords(toolName string, id ToolCallIdentity) AgentErrorWords {
 	change := fileChange(toolName)
 	return AgentErrorWords{
 		Effect:          "the " + change + " may have been applied",
-		Check:           checkFileText,
+		Check:           checkFileText(id),
 		RestartedEffect: "the " + change + " may have been applied before the restart",
 	}
 }
 
 // fileRequestErrorWords are fileToolErrorWords plus the words of an
 // input_mismatch refusal, which only an edit or write request gets.
-func fileRequestErrorWords(toolName string) AgentErrorWords {
-	words := fileToolErrorWords(toolName)
+func fileRequestErrorWords(toolName string, id ToolCallIdentity) AgentErrorWords {
+	words := fileToolErrorWords(toolName, id)
 	words.Action, words.Existing = "edit files", "an edit for this tool call"
 	if toolName == WriteFileToolName {
 		words.Action, words.Existing = "write file", "a write for this tool call"
@@ -63,9 +66,9 @@ func fileToolChangeLost(err error) bool {
 // attempt of the tool call may have applied the change unless no change
 // can survive.
 func fileToolConnErrorResult(ctx context.Context, toolName string, err error) fantasy.ToolResponse {
-	if _, ok := reportableToolCall(ctx); ok && !fileToolChangeLost(err) {
+	if id, ok := reportableToolCall(ctx); ok && !fileToolChangeLost(err) {
 		return fantasy.NewTextErrorResponse(UnknownOutcome(AgentUnreachableReason(err),
-			"an earlier attempt may have applied the "+fileChange(toolName), checkFileText))
+			"an earlier attempt may have applied the "+fileChange(toolName), checkFileText(id)))
 	}
 	return fantasy.NewTextErrorResponse(err.Error())
 }
@@ -79,10 +82,11 @@ func fileRequestErrorResult(ctx context.Context, toolName string, err error) (re
 	if err == nil {
 		return fantasy.ToolResponse{}, false
 	}
-	if _, ok := reportableToolCall(ctx); !ok {
+	id, ok := reportableToolCall(ctx)
+	if !ok {
 		return fantasy.ToolResponse{}, false
 	}
-	text, ok := AgentErrorText(err, fileRequestErrorWords(toolName))
+	text, ok := AgentErrorText(err, fileRequestErrorWords(toolName, id))
 	if !ok {
 		return fantasy.ToolResponse{}, false
 	}
@@ -96,13 +100,13 @@ func fileRequestErrorResult(ctx context.Context, toolName string, err error) (re
 // which gives the result the tool returns for it. ok is false when the
 // call keeps the caller's generic interrupted result: the agent's answer
 // does not describe the tool call (an error answer, including the 404 of
-// an agent without the cancel route).
-func InterruptFileToolCall(ctx context.Context, conn workspacesdk.AgentConn, toolName string, id ToolCallIdentity) (result fantasy.ToolResponse, ok bool) {
+// an agent without the cancel route). The cancel request waits at most
+// AgentAnswerTimeout on clock (nil means a real clock).
+func InterruptFileToolCall(ctx context.Context, clock quartz.Clock, conn workspacesdk.AgentConn, toolName string, id ToolCallIdentity) (result fantasy.ToolResponse, ok bool) {
 	// A zero stop run age never stops a process; file tools start none.
-	resp, err := conn.CancelToolCall(workspacesdk.WithToolCall(ctx, id.AgentToolCall()), id.UUID(),
-		workspacesdk.CancelToolCallRequest{StopIfRunAgeBelowMs: 0})
+	resp, err := cancelToolCall(ctx, clock, conn, id, 0)
 	if err != nil {
-		text, ok := AgentErrorText(err, fileToolErrorWords(toolName))
+		text, ok := AgentErrorText(err, fileToolErrorWords(toolName, id))
 		return fantasy.NewTextErrorResponse(text), ok
 	}
 	if !resp.Started {
@@ -121,10 +125,10 @@ func InterruptFileToolCall(ctx context.Context, conn workspacesdk.AgentConn, too
 // call keeps the caller's generic interrupted result: no change can have
 // survived. A stopped workspace keeps its disk, so a call without a
 // workspace agent gets an unknown result.
-func InterruptFileToolCallUnreachable(toolName string, err error) (result fantasy.ToolResponse, ok bool) {
+func InterruptFileToolCallUnreachable(toolName string, id ToolCallIdentity, err error) (result fantasy.ToolResponse, ok bool) {
 	if fileToolChangeLost(err) {
 		return fantasy.ToolResponse{}, false
 	}
-	words := fileToolErrorWords(toolName)
+	words := fileToolErrorWords(toolName, id)
 	return fantasy.NewTextErrorResponse(UnknownOutcome(AgentUnreachableReason(err), words.Effect, words.Check)), true
 }

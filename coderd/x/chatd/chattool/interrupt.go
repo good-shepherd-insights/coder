@@ -69,7 +69,7 @@ func (c InterruptedCall) SameCancel(other InterruptedCall) bool {
 // call keeps the generic interrupted result.
 func (c InterruptedCall) Interrupt(ctx context.Context, clock quartz.Clock, conn workspacesdk.AgentConn, id ToolCallIdentity) (resp fantasy.ToolResponse, ok bool) {
 	if c.toolName != ExecuteToolName {
-		return InterruptFileToolCall(ctx, conn, c.toolName, id)
+		return InterruptFileToolCall(ctx, clock, conn, c.toolName, id)
 	}
 	result, ok := InterruptExecute(ctx, clock, conn, id, c.args)
 	return marshalToolResponse(result), ok
@@ -80,7 +80,7 @@ func (c InterruptedCall) Interrupt(ctx context.Context, clock quartz.Clock, conn
 // call keeps the generic interrupted result.
 func (c InterruptedCall) Unreachable(id ToolCallIdentity, err error) (resp fantasy.ToolResponse, ok bool) {
 	if c.toolName != ExecuteToolName {
-		return InterruptFileToolCallUnreachable(c.toolName, err)
+		return InterruptFileToolCallUnreachable(c.toolName, id, err)
 	}
 	result, ok := InterruptExecuteUnreachable(id, c.args, err)
 	return marshalToolResponse(result), ok

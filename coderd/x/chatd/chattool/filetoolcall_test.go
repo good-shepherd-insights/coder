@@ -363,7 +363,7 @@ func TestInterruptFileToolCall(t *testing.T) {
 							return tc.resp, tc.err
 						})
 
-					resp, ok := chattool.InterruptFileToolCall(context.Background(), mockConn, toolName, id)
+					resp, ok := chattool.InterruptFileToolCall(context.Background(), nil, mockConn, toolName, id)
 					if tc.generic {
 						assert.False(t, ok)
 						return
@@ -409,7 +409,7 @@ func TestInterruptFileToolCallUnreachable(t *testing.T) {
 			t.Run(toolName+"/"+tt.name, func(t *testing.T) {
 				t.Parallel()
 
-				resp, ok := chattool.InterruptFileToolCallUnreachable(toolName, tt.err)
+				resp, ok := chattool.InterruptFileToolCallUnreachable(toolName, newInterruptIdentity(t), tt.err)
 				require.Equal(t, tt.wantOK, ok)
 				if !ok {
 					return
@@ -420,5 +420,114 @@ func TestInterruptFileToolCallUnreachable(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestFileToolCallNoAnswer covers edit, write, and cancel requests the
+// workspace agent never answers: each ends after the agent answer
+// timeout, and the result is unknown with the file wording and the tool
+// call UUID.
+func TestFileToolCallNoAnswer(t *testing.T) {
+	t.Parallel()
+
+	// noAnswer blocks until the request's context ends, as a connected
+	// agent that never answers does.
+	noAnswer := func(ctx context.Context) error {
+		<-ctx.Done()
+		return &url.Error{Op: http.MethodPost, URL: "http://agent/api/v0", Err: ctx.Err()}
+	}
+	tests := []struct {
+		name     string
+		toolName string
+		// run runs the request through the tool or the interrupt path.
+		run func(ctx context.Context, clock quartz.Clock, conn *agentconnmock.MockAgentConn, id chattool.ToolCallIdentity) fantasy.ToolResponse
+	}{
+		{
+			name:     "EditFiles",
+			toolName: chattool.EditFilesToolName,
+			run: func(ctx context.Context, clock quartz.Clock, conn *agentconnmock.MockAgentConn, id chattool.ToolCallIdentity) fantasy.ToolResponse {
+				conn.EXPECT().EditFiles(gomock.Any(), gomock.Any()).DoAndReturn(func(ctx context.Context, _ workspacesdk.FileEditRequest) (workspacesdk.FileEditResponse, error) {
+					return workspacesdk.FileEditResponse{}, noAnswer(ctx)
+				})
+				tool := chattool.EditFiles(chattool.EditFilesOptions{
+					GetWorkspaceConn: func(context.Context) (workspacesdk.AgentConn, error) { return conn, nil },
+					Clock:            clock,
+				})
+				resp, err := tool.Run(chattool.WithToolCallIdentity(ctx, id), fantasy.ToolCall{
+					ID:    "call-1",
+					Name:  chattool.EditFilesToolName,
+					Input: `{"files":[{"path":"/a.txt","edits":[{"old_text":"old","new_text":"new"}]}]}`,
+				})
+				assert.NoError(t, err)
+				return resp
+			},
+		},
+		{
+			name:     "WriteFile",
+			toolName: chattool.WriteFileToolName,
+			run: func(ctx context.Context, clock quartz.Clock, conn *agentconnmock.MockAgentConn, id chattool.ToolCallIdentity) fantasy.ToolResponse {
+				conn.EXPECT().WriteFile(gomock.Any(), "/a.txt", gomock.Any()).DoAndReturn(func(ctx context.Context, _ string, _ io.Reader) error {
+					return noAnswer(ctx)
+				})
+				tool := chattool.WriteFile(chattool.WriteFileOptions{
+					GetWorkspaceConn: func(context.Context) (workspacesdk.AgentConn, error) { return conn, nil },
+					Clock:            clock,
+				})
+				resp, err := tool.Run(chattool.WithToolCallIdentity(ctx, id), fantasy.ToolCall{
+					ID:    "call-1",
+					Name:  chattool.WriteFileToolName,
+					Input: `{"path":"/a.txt","content":"content"}`,
+				})
+				assert.NoError(t, err)
+				return resp
+			},
+		},
+		{
+			name:     "InterruptEditFiles",
+			toolName: chattool.EditFilesToolName,
+			run: func(ctx context.Context, clock quartz.Clock, conn *agentconnmock.MockAgentConn, id chattool.ToolCallIdentity) fantasy.ToolResponse {
+				conn.EXPECT().CancelToolCall(gomock.Any(), id.UUID(), workspacesdk.CancelToolCallRequest{}).
+					DoAndReturn(func(ctx context.Context, _ string, _ workspacesdk.CancelToolCallRequest) (workspacesdk.CancelToolCallResponse, error) {
+						return workspacesdk.CancelToolCallResponse{}, noAnswer(ctx)
+					})
+				call, ok := chattool.NewInterruptedCall(chattool.EditFilesToolName, `{"files":[]}`)
+				require.True(t, ok)
+				resp, ok := call.Interrupt(ctx, clock, conn, id)
+				assert.True(t, ok)
+				return resp
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := testutil.Context(t, testutil.WaitShort)
+			clock := quartz.NewMock(t)
+			answerTimer := clock.Trap().AfterFunc("chattool", "agent-answer")
+			defer answerTimer.Close()
+			dbNow := time.Now()
+			id := chattool.ToolCallIdentity{
+				ChatID:     uuid.New(),
+				MessageID:  42,
+				ToolCallID: "call_" + uuid.NewString(),
+				Age:        chattool.NewToolCallAge(clock, dbNow, dbNow.Add(-time.Minute)),
+			}
+			conn := agentconnmock.NewMockAgentConn(gomock.NewController(t))
+
+			done := make(chan fantasy.ToolResponse, 1)
+			go func() { done <- tt.run(ctx, clock, conn, id) }()
+			call := answerTimer.MustWait(ctx)
+			assert.Equal(t, chattool.AgentAnswerTimeout, call.Duration)
+			call.MustRelease(ctx)
+			clock.Advance(chattool.AgentAnswerTimeout).MustWait(ctx)
+
+			resp := testutil.RequireReceive(ctx, t, done)
+			assert.True(t, resp.IsError, resp.Content)
+			assert.Contains(t, resp.Content, "outcome unknown: "+chattool.AgentNoAnswerReason)
+			assert.Contains(t, resp.Content, "may have been applied")
+			assert.Contains(t, resp.Content, "Check the file")
+			assert.Contains(t, resp.Content, id.UUID())
+		})
 	}
 }
