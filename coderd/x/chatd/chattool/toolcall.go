@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/xerrors"
 
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/codersdk/workspacesdk"
@@ -106,11 +107,18 @@ const (
 	// AgentErrorUnreadable means the agent answered, but the answer
 	// could not be read, so it may have acted.
 	AgentErrorUnreadable
+	// AgentErrorNoAnswer means the agent did not answer within
+	// AgentAnswerTimeout (ErrAgentAnswerTimeout). The request may have
+	// arrived.
+	AgentErrorNoAnswer
 )
 
 // ClassifyAgentError classifies err, returned by a workspace agent
 // request made for a tool call. code is set for AgentErrorRefused.
 func ClassifyAgentError(err error) (kind AgentErrorKind, code workspacesdk.ToolCallErrorCode) {
+	if errors.Is(err, ErrAgentAnswerTimeout) {
+		return AgentErrorNoAnswer, ""
+	}
 	var tcErr *workspacesdk.ToolCallError
 	if errors.As(err, &tcErr) {
 		return AgentErrorRefused, tcErr.Code
@@ -126,6 +134,42 @@ func ClassifyAgentError(err error) (kind AgentErrorKind, code workspacesdk.ToolC
 	}
 	return AgentErrorUnreadable, ""
 }
+
+// AgentAnswerTimeout is how long chatd waits for the workspace agent to
+// answer one start, edit, write, or cancel request made for a tool call.
+// It bounds the wait for the answer, never the work, so every attempt
+// ends with an answer or an unknown outcome even when a connected agent
+// never answers.
+const AgentAnswerTimeout = time.Minute
+
+// ErrAgentAnswerTimeout is wrapped by the error of a request that
+// AwaitAgentAnswer ended because the agent did not answer in time.
+var ErrAgentAnswerTimeout = xerrors.New("the workspace agent did not answer within " + AgentAnswerTimeout.String())
+
+// AwaitAgentAnswer calls request with a context that also ends after
+// AgentAnswerTimeout on clock, and returns its error. When that timeout
+// ended the request, the error wraps ErrAgentAnswerTimeout; when ctx
+// ended it, the error is returned unchanged. A nil error is returned
+// unchanged even if the timeout fired meanwhile, because the answer was
+// received. A nil clock means a real clock.
+func AwaitAgentAnswer(ctx context.Context, clock quartz.Clock, request func(ctx context.Context) error) error {
+	if clock == nil {
+		clock = quartz.NewReal()
+	}
+	reqCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	timer := clock.AfterFunc(AgentAnswerTimeout, func() { cancel(ErrAgentAnswerTimeout) }, "chattool", "agent-answer")
+	defer timer.Stop()
+	err := request(reqCtx)
+	if err != nil && errors.Is(context.Cause(reqCtx), ErrAgentAnswerTimeout) {
+		return xerrors.Errorf("%v: %w", err, ErrAgentAnswerTimeout)
+	}
+	return err
+}
+
+// AgentNoAnswerReason is why the outcome of a tool call is unknown when
+// the workspace agent did not answer within AgentAnswerTimeout.
+var AgentNoAnswerReason = ErrAgentAnswerTimeout.Error()
 
 // AgentRestartedReason is why the outcome of a tool call refused with
 // workspacesdk.ToolCallErrorAgentStartedAfterToolCall is unknown.
@@ -188,6 +232,8 @@ func AgentErrorText(err error, words AgentErrorWords) (text string, ok bool) {
 		return UnknownOutcome(AgentUnreachableReason(err), words.Effect, words.Check), true
 	case kind == AgentErrorUnreadable:
 		return UnknownOutcome(AgentUnreadableReason(err), words.Effect, words.Check), true
+	case kind == AgentErrorNoAnswer:
+		return UnknownOutcome(AgentNoAnswerReason, words.Effect, words.Check), true
 	default:
 		return "", false
 	}
