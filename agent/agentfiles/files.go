@@ -1,11 +1,7 @@
 package agentfiles
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -318,51 +314,12 @@ func (api *API) HandleWriteFile(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key, toolCall, hasToolCall, ok := readToolCall(ctx, rw, r)
-	if !ok {
-		return
-	}
-	if !hasToolCall {
-		res := api.writeFileResponse(ctx, path, r.Body)
-		httpapi.Write(ctx, rw, res.status, res.body)
-		return
-	}
-
-	// The input hash covers the content, so the whole body is read into
-	// memory before the tool call decision. The route has no body size
-	// limit, as without tool call headers; chatd sends content the model
-	// produced, which it already holds in memory.
-	content, err := io.ReadAll(r.Body)
+	status, err := api.writeFile(ctx, r, path)
 	if err != nil {
-		httpapi.Write(ctx, rw, http.StatusBadRequest, codersdk.Response{
-			Message: "Failed to read request body.",
-			Detail:  err.Error(),
+		httpapi.Write(ctx, rw, status, codersdk.Response{
+			Message: err.Error(),
 		})
 		return
-	}
-	api.runToolCall(ctx, rw, key, toolCall.Age, writeFileInput(path, content), func() fileResult {
-		return api.writeFileResponse(ctx, path, bytes.NewReader(content))
-	})
-}
-
-// writeFileInput is the tool call input hash of a write: the path and
-// the content, with the path length first so that no two pairs share an
-// encoding.
-func writeFileInput(path string, content []byte) [sha256.Size]byte {
-	h := sha256.New()
-	_ = binary.Write(h, binary.BigEndian, uint64(len(path)))
-	_, _ = io.WriteString(h, path)
-	_, _ = h.Write(content)
-	return [sha256.Size]byte(h.Sum(nil))
-}
-
-// writeFileResponse writes body to path and returns the response.
-func (api *API) writeFileResponse(ctx context.Context, path string, body io.Reader) fileResult {
-	status, err := api.writeFile(ctx, body, path)
-	if err != nil {
-		return fileResult{status: status, body: codersdk.Response{
-			Message: err.Error(),
-		}}
 	}
 
 	// Track edited path for git watch.
@@ -372,12 +329,12 @@ func (api *API) writeFileResponse(ctx context.Context, path string, body io.Read
 		}
 	}
 
-	return fileResult{status: http.StatusOK, body: codersdk.Response{
+	httpapi.Write(ctx, rw, http.StatusOK, codersdk.Response{
 		Message: fmt.Sprintf("Successfully wrote to %q", path),
-	}}
+	})
 }
 
-func (api *API) writeFile(ctx context.Context, body io.Reader, path string) (HTTPResponseCode, error) {
+func (api *API) writeFile(ctx context.Context, r *http.Request, path string) (HTTPResponseCode, error) {
 	if !filepath.IsAbs(path) {
 		return http.StatusBadRequest, xerrors.Errorf("file path must be absolute: %q", path)
 	}
@@ -412,7 +369,7 @@ func (api *API) writeFile(ctx context.Context, body io.Reader, path string) (HTT
 		mode = &m
 	}
 
-	return api.atomicWrite(ctx, path, mode, body)
+	return api.atomicWrite(ctx, path, mode, r.Body)
 }
 
 func (api *API) HandleEditFiles(rw http.ResponseWriter, r *http.Request) {
@@ -423,37 +380,11 @@ func (api *API) HandleEditFiles(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key, toolCall, hasToolCall, ok := readToolCall(ctx, rw, r)
-	if !ok {
-		return
-	}
-	if !hasToolCall {
-		res := api.editFilesResponse(ctx, req)
-		httpapi.Write(ctx, rw, res.status, res.body)
-		return
-	}
-
-	// The input is the request as decoded, before editFilesResponse
-	// merges duplicate paths.
-	input, err := json.Marshal(req)
-	if err != nil {
-		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
-			Message: "Failed to encode edit request.",
-			Detail:  err.Error(),
+	if len(req.Files) == 0 {
+		httpapi.Write(ctx, rw, http.StatusBadRequest, codersdk.Response{
+			Message: "must specify at least one file",
 		})
 		return
-	}
-	api.runToolCall(ctx, rw, key, toolCall.Age, sha256.Sum256(input), func() fileResult {
-		return api.editFilesResponse(ctx, req)
-	})
-}
-
-// editFilesResponse applies req and returns the response.
-func (api *API) editFilesResponse(ctx context.Context, req workspacesdk.FileEditRequest) fileResult {
-	if len(req.Files) == 0 {
-		return fileResult{status: http.StatusBadRequest, body: codersdk.Response{
-			Message: "must specify at least one file",
-		}}
 	}
 
 	// Merge duplicate entries that refer to the same literal path
@@ -482,9 +413,10 @@ func (api *API) editFilesResponse(ctx context.Context, req workspacesdk.FileEdit
 			}
 			// Different paths, same real file (symlink alias).
 			msg := fmt.Sprintf("duplicate file path %q aliases %q (same real file): combine edits into a single entry's \"edits\" list", f.Path, prev.caller)
-			return fileResult{status: http.StatusBadRequest, body: codersdk.Response{
+			httpapi.Write(ctx, rw, http.StatusBadRequest, codersdk.Response{
 				Message: msg,
-			}}
+			})
+			return
 		}
 		seenPaths[key] = seenEntry{caller: f.Path, index: len(merged)}
 		merged = append(merged, f)
@@ -511,9 +443,10 @@ func (api *API) editFilesResponse(ctx context.Context, req workspacesdk.FileEdit
 	}
 
 	if combinedErr != nil {
-		return fileResult{status: status, body: codersdk.Response{
+		httpapi.Write(ctx, rw, status, codersdk.Response{
 			Message: combinedErr.Error(),
-		}}
+		})
+		return
 	}
 
 	// Phase 2: write all files via atomicWrite. A failure here
@@ -523,9 +456,10 @@ func (api *API) editFilesResponse(ctx context.Context, req workspacesdk.FileEdit
 		mode := p.mode
 		s, err := api.atomicWrite(ctx, p.path, &mode, strings.NewReader(p.content))
 		if err != nil {
-			return fileResult{status: s, body: codersdk.Response{
+			httpapi.Write(ctx, rw, s, codersdk.Response{
 				Message: err.Error(),
-			}}
+			})
+			return
 		}
 	}
 
@@ -562,7 +496,7 @@ func (api *API) editFilesResponse(ctx context.Context, req workspacesdk.FileEdit
 			})
 		}
 	}
-	return fileResult{status: http.StatusOK, body: resp}
+	httpapi.Write(ctx, rw, http.StatusOK, resp)
 }
 
 // prepareFileEdit validates, reads, and computes edits for a single

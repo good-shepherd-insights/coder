@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/spf13/afero"
 	"golang.org/x/xerrors"
 
@@ -47,7 +48,7 @@ type process struct {
 	exitedAt   *int64
 	done       chan struct{} // closed when process exits
 	// startTime is when the process started, from the manager clock.
-	// Process age is measured from it.
+	// Run age is measured from it.
 	startTime time.Time
 	// toolCall is the tool call that started the process, nil for a
 	// start without tool call headers.
@@ -93,13 +94,13 @@ type manager struct {
 	updateEnv  func(current []string) (updated []string, err error)
 	workingDir func() string
 	envInfo    usershell.EnvInfoer
-	// records decides whether a start or cancel with tool call headers
-	// acts, and maps each tool call to its process.
-	records *agenttoolcall.Records[*process]
+	// toolCallStore holds the tool call records that decide reaping of tool
+	// call processes. It may be nil.
+	toolCallStore *agenttoolcall.Store
 }
 
 // newManager creates a new process manager.
-func newManager(logger slog.Logger, execer agentexec.Execer, fs afero.Fs, envInfo usershell.EnvInfoer, updateEnv func(current []string) (updated []string, err error), workingDir func() string, clock quartz.Clock, toolCallChats *agenttoolcall.Chats) *manager {
+func newManager(logger slog.Logger, execer agentexec.Execer, fs afero.Fs, envInfo usershell.EnvInfoer, updateEnv func(current []string) (updated []string, err error), workingDir func() string, clock quartz.Clock, toolCallStore *agenttoolcall.Store) *manager {
 	if fs == nil {
 		fs = afero.NewOsFs()
 	}
@@ -107,24 +108,26 @@ func newManager(logger slog.Logger, execer agentexec.Execer, fs afero.Fs, envInf
 		envInfo = &usershell.SystemEnvInfo{}
 	}
 	return &manager{
-		logger:     logger,
-		execer:     execer,
-		fs:         fs,
-		clock:      clock,
-		procs:      make(map[string]*process),
-		updateEnv:  updateEnv,
-		workingDir: workingDir,
-		envInfo:    envInfo,
-		records:    agenttoolcall.NewRecords[*process](toolCallChats),
+		logger:        logger,
+		execer:        execer,
+		fs:            fs,
+		clock:         clock,
+		procs:         make(map[string]*process),
+		updateEnv:     updateEnv,
+		workingDir:    workingDir,
+		envInfo:       envInfo,
+		toolCallStore: toolCallStore,
 	}
 }
 
-// start spawns a new process with the given ID. toolCall is the tool
-// call that starts it, or nil. Both foreground and background
-// processes use a long-lived context so the process survives
-// the HTTP request lifecycle. The background flag only affects
-// client-side polling behavior.
-func (m *manager) start(req workspacesdk.StartProcessRequest, chatID, id string, toolCall *agenttoolcall.Key) (*process, error) {
+// start spawns a new process. For a start behind the tool call
+// middleware, toolCall supplies the process ID (the tool call UUID) and
+// the start time (the record's creation, where run age starts);
+// otherwise the ID is random and the start time is the spawn. Both
+// foreground and background processes use a long-lived context so the
+// process survives the HTTP request lifecycle. The background flag only
+// affects client-side polling behavior.
+func (m *manager) start(req workspacesdk.StartProcessRequest, chatID string, toolCall *agenttoolcall.ToolCall) (*process, error) {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -132,6 +135,12 @@ func (m *manager) start(req workspacesdk.StartProcessRequest, chatID, id string,
 	}
 	m.mu.Unlock()
 
+	id := uuid.New().String()
+	var key *agenttoolcall.Key
+	if toolCall != nil {
+		id = toolCall.UUID.String()
+		key = &toolCall.Key
+	}
 	logger := m.logger
 	if chatID != "" {
 		logger = logger.With(slog.F("chat_id", chatID))
@@ -194,6 +203,9 @@ func (m *manager) start(req workspacesdk.StartProcessRequest, chatID, id string,
 	cmd.Env = nil
 
 	startTime := m.clock.Now()
+	if toolCall != nil {
+		startTime = toolCall.StartedAt
+	}
 	proc := &process{
 		id:         id,
 		command:    req.Command,
@@ -207,7 +219,7 @@ func (m *manager) start(req workspacesdk.StartProcessRequest, chatID, id string,
 		running:    true,
 		done:       make(chan struct{}),
 		startTime:  startTime,
-		toolCall:   toolCall,
+		toolCall:   key,
 	}
 
 	m.mu.Lock()
@@ -285,7 +297,7 @@ func (m *manager) list(chatID string) []workspacesdk.ProcessInfo {
 		// that process stays until a newer message drops the record.
 		if !info.Running && info.ExitedAt != nil {
 			exitedAt := time.Unix(*info.ExitedAt, 0)
-			current := proc.toolCall != nil && m.records.Current(*proc.toolCall)
+			current := proc.toolCall != nil && m.toolCallStore != nil && m.toolCallStore.Current(*proc.toolCall)
 			if !current && now.Sub(exitedAt) > exitedProcessReapAge {
 				delete(m.procs, id)
 				continue
@@ -344,35 +356,62 @@ func (m *manager) age(p *process) time.Duration {
 	return m.clock.Since(p.startTime)
 }
 
-// killAndWait sends SIGKILL to p's process group if p is running, then
-// waits for p to exit or for ctx to end. killed reports whether a
-// cancel's SIGKILL, from this call or an earlier one, ended the process,
-// so a natural exit racing the signal does not count.
-func (p *process) killAndWait(ctx context.Context) (killed bool, err error) {
+// stop kills p's process group if p is running with a run age below
+// stopIfRunAgeBelow, then waits for a process a cancel killed to exit, or
+// for ctx to end. The age check and the kill happen under p.mu, so the
+// decision uses the run age at the moment of the kill.
+func (m *manager) stop(ctx context.Context, p *process, stopIfRunAgeBelow time.Duration) error {
 	p.mu.Lock()
-	if p.running {
+	wait := p.cancelKilled
+	if p.running && m.age(p) < stopIfRunAgeBelow {
 		err := signalProcess(p.cmd.Process, syscall.SIGKILL)
 		switch {
 		case err == nil:
 			p.cancelKilled = true
+			wait = true
 		case errors.Is(err, syscall.ESRCH), errors.Is(err, os.ErrProcessDone):
-			// The process exited before the exit goroutine marked
-			// it as not running.
+			// The process exited before the exit goroutine marked it as
+			// not running. Wait for that goroutine, or the answer would
+			// report a finished process as running.
+			wait = true
 		default:
 			p.mu.Unlock()
-			return false, xerrors.Errorf("kill process: %w", err)
+			return xerrors.Errorf("kill process: %w", err)
 		}
 	}
 	p.mu.Unlock()
+	if !wait {
+		return nil
+	}
 
 	select {
 	case <-p.done:
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		// cmd.Wait set ProcessState before done was closed.
-		return p.cancelKilled && terminatedByKill(p.cmd.ProcessState), nil
+		return nil
 	case <-ctx.Done():
-		return false, xerrors.Errorf("wait for process exit: %w", ctx.Err())
+		return xerrors.Errorf("wait for process exit: %w", ctx.Err())
+	}
+}
+
+// toolCallProcessState returns p's state for a cancel answer. Canceled is
+// true only when a cancel's SIGKILL ended the process, so a natural exit
+// racing the signal does not count.
+func (m *manager) toolCallProcessState(p *process) workspacesdk.ToolCallProcess {
+	// Read info before output, as handleProcessOutput does, so an exited
+	// process's output is final.
+	info := p.info()
+	output, truncated := p.output()
+	p.mu.Lock()
+	// cmd.Wait set ProcessState before the process was marked as not
+	// running.
+	canceled := p.cancelKilled && !info.Running && terminatedByKill(p.cmd.ProcessState)
+	p.mu.Unlock()
+	return workspacesdk.ToolCallProcess{
+		Running:   info.Running,
+		Canceled:  canceled,
+		Output:    output,
+		Truncated: truncated,
+		ExitCode:  info.ExitCode,
+		RunAgeMs:  m.age(p).Milliseconds(),
 	}
 }
 

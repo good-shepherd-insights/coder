@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"regexp"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"charm.land/fantasy"
 	"golang.org/x/xerrors"
 
+	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/codersdk/workspacesdk"
 )
 
@@ -165,6 +167,19 @@ func (a ExecuteArgs) EffectiveTimeout(optionTimeout time.Duration) (time.Duratio
 	return timeout, nil
 }
 
+// InterruptStopRunAge returns the run age below which interrupt handling
+// stops the process of an execute call with a: its effective timeout in
+// the foreground, so a process past its execute deadline keeps running,
+// and 0, which never stops, in the background. ok is false when the tool
+// starts no process for a.
+func (a ExecuteArgs) InterruptStopRunAge() (stopAge time.Duration, ok bool) {
+	if a.RunsInBackground() {
+		return 0, true
+	}
+	timeout, err := a.EffectiveTimeout(ExecuteDefaultTimeout)
+	return timeout, err == nil
+}
+
 // Execute returns an AgentTool that runs a shell command in the
 // workspace via the agent HTTP API.
 func Execute(options ExecuteOptions) fantasy.AgentTool {
@@ -179,7 +194,7 @@ func Execute(options ExecuteOptions) fantasy.AgentTool {
 			if err != nil {
 				// An earlier attempt of this tool call may have started
 				// the command, unless no workspace agent exists to run it.
-				if id, ok := ToolCallIdentityFromContext(ctx); ok && ctx.Err() == nil && !HasNoWorkspaceAgent(err) {
+				if id, ok := reportableToolCall(ctx); ok && !HasNoWorkspaceAgent(err) {
 					return fantasy.NewTextErrorResponse(UnknownOutcome(AgentUnreachableReason(err),
 						"an earlier attempt may have started the command", checkProcessText(id))), nil
 				}
@@ -236,11 +251,7 @@ func executeBackground(
 	workDir string,
 	env map[string]string,
 ) fantasy.ToolResponse {
-	startCtx := ctx
-	if id, ok := ToolCallIdentityFromContext(ctx); ok {
-		startCtx = workspacesdk.WithToolCall(ctx, id.AgentToolCall())
-	}
-	resp, err := conn.StartProcess(startCtx, workspacesdk.StartProcessRequest{
+	resp, err := conn.StartProcess(withToolCallHeaders(ctx), workspacesdk.StartProcessRequest{
 		Command:    command,
 		WorkDir:    workDir,
 		Env:        env,
@@ -287,12 +298,7 @@ func executeForeground(
 
 	start := time.Now()
 
-	id, hasID := ToolCallIdentityFromContext(ctx)
-	startCtx := cmdCtx
-	if hasID {
-		startCtx = workspacesdk.WithToolCall(cmdCtx, id.AgentToolCall())
-	}
-	resp, err := conn.StartProcess(startCtx, workspacesdk.StartProcessRequest{
+	resp, err := conn.StartProcess(withToolCallHeaders(cmdCtx), workspacesdk.StartProcessRequest{
 		Command:    args.Command,
 		WorkDir:    workDir,
 		Env:        env,
@@ -303,7 +309,7 @@ func executeForeground(
 	}
 
 	var result ExecuteResult
-	if hasID && resp.ID == id.UUID() {
+	if id, ok := ToolCallIdentityFromContext(ctx); ok && resp.ID == id.UUID() {
 		result = waitForToolCallProcess(ctx, conn, resp, timeout)
 	} else {
 		result = waitForProcess(cmdCtx, ctx, conn, resp.ID, timeout)
@@ -333,165 +339,156 @@ func HasNoWorkspaceAgent(err error) bool {
 }
 
 // startErrorResult converts a StartProcess error into a result. ctx is
-// the tool call's context. A *workspacesdk.ToolCallError is the agent's
-// answer for the tool call in ctx.
+// the tool call's context.
 func startErrorResult(ctx context.Context, action string, err error) fantasy.ToolResponse {
-	id, hasID := ToolCallIdentityFromContext(ctx)
-	kind, code := ClassifyAgentError(err)
-	switch {
-	case kind == AgentErrorRefused:
-		switch code {
-		case workspacesdk.ToolCallErrorAgentStartedAfterToolCall:
-			return errorResult(UnknownOutcome(AgentRestartedReason,
-				"the command may have run before the restart", "Check the workspace state before running it again."))
-		case workspacesdk.ToolCallErrorInputMismatch:
-			return errorResult(fmt.Sprintf("%s: this request changed nothing because a process for this tool call "+
-				"already exists with a different input (process ID %s): %v", action, id.UUID(), err))
-		default:
-			// stale_tool_call and tool_call_canceled reach only a stale
-			// attempt, whose commit fails the history version fence.
-			return errorResult(fmt.Sprintf("%s: %v", action, err))
-		}
-	// A canceled ctx means the result will not be committed.
-	case !hasID || kind == AgentErrorResponse || ctx.Err() != nil:
-		return errorResult(enrichStartError(fmt.Sprintf("%s: %v", action, err)))
-	case kind == AgentErrorUnreachable:
-		return errorResult(UnknownOutcome(AgentUnreachableReason(err), "the command may have started", checkProcessText(id)))
-	default:
-		return errorResult(UnknownOutcome(AgentUnreadableReason(err), "the command may have started", checkProcessText(id)))
-	}
-}
-
-// InterruptExecute ends a foreground execute call the user interrupted
-// and returns its result. timeout is the call's effective timeout. A
-// process past its execute deadline keeps running, as the timed out
-// result with background_process_id promises, and so does one whose
-// state cannot be read; anything else is canceled. ok is false when the
-// agent's answer does not describe the tool call: an error response
-// other than agent_started_after_tool_call, including the 404 of an
-// agent without the cancel route.
-func InterruptExecute(ctx context.Context, conn workspacesdk.AgentConn, id ToolCallIdentity, timeout time.Duration) (result ExecuteResult, ok bool) {
-	processID := id.UUID()
-	// The execute deadline is process start plus timeout, and the process
-	// starts after the tool call is committed, so a younger tool call is
-	// within it. Both ages are measured when the request is sent, after
-	// the dial, so a deadline that passes during the dial keeps the process
-	// running.
-	if id.Age.Now() >= timeout {
-		out, err := conn.ProcessOutput(ctx, processID, nil)
-		if err == nil && out.Running && time.Duration(out.AgeMs)*time.Millisecond >= timeout {
-			result := timedOutRunningResult(out, timeout, processID)
-			result.WallDurationMs = out.AgeMs
-			return result, true
-		}
-		if err != nil {
-			// Without the agent's answer the process may be past its
-			// deadline, and canceling it would break the timed out
-			// result's promise.
-			switch kind, _ := ClassifyAgentError(err); kind {
-			case AgentErrorUnreachable:
-				return notCanceledResult(id, AgentUnreachableReason(err)), true
-			case AgentErrorUnreadable:
-				return notCanceledResult(id, AgentUnreadableReason(err)), true
-			}
+	if id, ok := reportableToolCall(ctx); ok {
+		if text, ok := AgentErrorText(err, AgentErrorWords{
+			Action:          action,
+			Existing:        fmt.Sprintf("a process for this tool call (process ID %s)", id.UUID()),
+			Effect:          "the command may have started",
+			Check:           checkProcessText(id),
+			RestartedEffect: "the command may have run before the restart",
+			RestartedCheck:  "Check the workspace state before running it again.",
+		}); ok {
+			return errorResult(text)
 		}
 	}
-	resp, err := conn.CancelProcess(workspacesdk.WithToolCall(ctx, id.AgentToolCall()), processID)
-	return canceledExecuteResult(id, resp, err)
+	return errorResult(enrichStartError(fmt.Sprintf("%s: %v", action, err)))
 }
 
-// notCanceledResult is the result of a foreground execute call whose
-// process was left running because its state could not be read.
-func notCanceledResult(id ToolCallIdentity, reason string) ExecuteResult {
-	return ExecuteResult{Error: UnknownOutcome(reason,
-		"the command, which may be past its timeout, was not canceled and may still be running", checkOrSignalProcessText(id))}
+// reportableToolCall returns the identity of the tool call in ctx while
+// its result can still be committed; a canceled ctx means it will not be.
+func reportableToolCall(ctx context.Context) (ToolCallIdentity, bool) {
+	id, ok := ToolCallIdentityFromContext(ctx)
+	return id, ok && ctx.Err() == nil
 }
 
-// InterruptBackgroundExecute returns the result of a background execute
-// call the user interrupted, without ending its process. ok is false when
-// the agent answers that it has no process for the tool call, including
-// an agent without tool call support, which picks another process ID.
-func InterruptBackgroundExecute(ctx context.Context, conn workspacesdk.AgentConn, id ToolCallIdentity) (result ExecuteResult, ok bool) {
-	processID := id.UUID()
-	_, err := conn.ProcessOutput(ctx, processID, nil)
-	if err == nil {
-		return backgroundStartedResult(processID), true
+// withToolCallHeaders returns ctx with the tool call headers of the tool
+// call in ctx attached, its age measured now. Without a tool call
+// identity it returns ctx.
+func withToolCallHeaders(ctx context.Context) context.Context {
+	id, ok := ToolCallIdentityFromContext(ctx)
+	if !ok {
+		return ctx
 	}
-	var reason string
-	switch kind, _ := ClassifyAgentError(err); kind {
-	case AgentErrorUnreachable:
-		return AgentUnreachableBackgroundExecuteResult(id, err), true
-	case AgentErrorUnreadable:
-		reason = AgentUnreadableReason(err)
-	default:
+	return workspacesdk.WithToolCall(ctx, id.AgentToolCall())
+}
+
+// InterruptExecute cancels an execute call the user interrupted and
+// returns its result, built from the workspace agent's answer. A
+// foreground process stops only while its run age is below the call's
+// effective timeout, so a process past its execute deadline keeps
+// running, as the timed out result with background_process_id promises.
+// A background process never stops. ok is false when the call keeps the
+// caller's generic interrupted result: the tool starts no process for
+// args, or the agent's answer does not describe the tool call (an error
+// answer, including the 404 of an agent without the cancel route).
+func InterruptExecute(ctx context.Context, conn workspacesdk.AgentConn, id ToolCallIdentity, args ExecuteArgs) (result ExecuteResult, ok bool) {
+	stopAge, ok := args.InterruptStopRunAge()
+	if !ok {
 		return ExecuteResult{}, false
 	}
-	return ExecuteResult{Error: UnknownOutcome(reason, backgroundRunningEffect, checkOrSignalProcessText(id))}, true
-}
-
-// backgroundRunningEffect is what may have happened to an interrupted
-// background execute call whose process the agent did not report.
-const backgroundRunningEffect = "the command may be running in the background"
-
-// canceledExecuteResult returns the result of a foreground execute call
-// from the workspace agent's answer to CancelProcess for its process.
-func canceledExecuteResult(id ToolCallIdentity, resp workspacesdk.CancelProcessResponse, err error) (result ExecuteResult, ok bool) {
+	processID := id.UUID()
+	resp, err := conn.CancelToolCall(workspacesdk.WithToolCall(ctx, id.AgentToolCall()), processID,
+		workspacesdk.CancelToolCallRequest{StopIfRunAgeBelowMs: stopAge.Milliseconds()})
 	if err != nil {
-		switch kind, code := ClassifyAgentError(err); {
-		case kind == AgentErrorRefused && code == workspacesdk.ToolCallErrorAgentStartedAfterToolCall:
-			return ExecuteResult{Error: UnknownOutcome(AgentRestartedReason,
-				"the command may have run before the restart", "Check the workspace state before running it again.")}, true
-		case kind == AgentErrorRefused, kind == AgentErrorResponse:
-			return ExecuteResult{}, false
-		case kind == AgentErrorUnreachable:
-			return AgentUnreachableExecuteResult(id, err), true
-		default:
-			return ExecuteResult{Error: UnknownOutcome(AgentUnreadableReason(err),
-				"the command may still be running", checkOrSignalProcessText(id))}, true
-		}
+		text, ok := AgentErrorText(err, interruptErrorWords(id, args))
+		return ExecuteResult{Error: text}, ok
 	}
+	if !resp.Started {
+		return ExecuteResult{Error: "not run: the command was canceled before the workspace agent received it."}, true
+	}
+	proc := resp.Process
 	switch {
-	case !resp.Started:
-		// The agent answers the same for a cancel that arrived before the
-		// start request and for a recorded start failure.
-		return ExecuteResult{Error: "not run: the command was canceled before the workspace agent received it, " +
-			"or the agent failed to start it."}, true
-	case resp.Canceled:
+	case proc == nil:
+		return recordedStartErrorResult(resp, args)
+	case proc.Canceled:
 		exitCode := -1
-		if resp.ExitCode != nil {
-			exitCode = *resp.ExitCode
+		if proc.ExitCode != nil {
+			exitCode = *proc.ExitCode
 		}
 		return ExecuteResult{
-			Output:         truncateOutput(resp.Output),
+			Output:         truncateOutput(proc.Output),
 			ExitCode:       exitCode,
-			WallDurationMs: resp.AgeMs,
-			Error:          fmt.Sprintf("canceled by the user after %s.", time.Duration(resp.AgeMs)*time.Millisecond),
-			Truncated:      resp.Truncated,
+			WallDurationMs: proc.RunAgeMs,
+			Error:          fmt.Sprintf("canceled by the user after %s.", time.Duration(proc.RunAgeMs)*time.Millisecond),
+			Truncated:      proc.Truncated,
 		}, true
+	case args.RunsInBackground():
+		return backgroundStartedResult(processID), true
+	case proc.Running:
+		// In the foreground, the stop age is the effective timeout.
+		result := timedOutRunningResult(toolCallProcessOutput(proc), stopAge, processID)
+		result.WallDurationMs = proc.RunAgeMs
+		return result, true
 	default:
-		result := completedResult(workspacesdk.ProcessOutputResponse{
-			Output:    resp.Output,
-			ExitCode:  resp.ExitCode,
-			Truncated: resp.Truncated,
-		})
-		result.WallDurationMs = resp.AgeMs
+		result := completedResult(toolCallProcessOutput(proc))
+		result.WallDurationMs = proc.RunAgeMs
 		return result, true
 	}
 }
 
-// AgentUnreachableExecuteResult returns the result of a foreground
-// execute call the user interrupted when the workspace agent could not
-// be reached.
-func AgentUnreachableExecuteResult(id ToolCallIdentity, err error) ExecuteResult {
-	return ExecuteResult{Error: UnknownOutcome(AgentUnreachableReason(err),
-		"the command may still be running", checkOrSignalProcessText(id))}
+// InterruptExecuteUnreachable returns the result of an execute call the
+// user interrupted when no connection to the workspace agent could be
+// made. ok is false when the call keeps the caller's generic interrupted
+// result: no workspace agent exists, so no process can be running.
+func InterruptExecuteUnreachable(id ToolCallIdentity, args ExecuteArgs, err error) (result ExecuteResult, ok bool) {
+	if HasNoWorkspaceAgent(err) {
+		return ExecuteResult{}, false
+	}
+	words := interruptErrorWords(id, args)
+	return ExecuteResult{Error: UnknownOutcome(AgentUnreachableReason(err), words.Effect, words.Check)}, true
 }
 
-// AgentUnreachableBackgroundExecuteResult returns the result of a
-// background execute call the user interrupted when the workspace agent
-// could not be reached.
-func AgentUnreachableBackgroundExecuteResult(id ToolCallIdentity, err error) ExecuteResult {
-	return ExecuteResult{Error: UnknownOutcome(AgentUnreachableReason(err), backgroundRunningEffect, checkOrSignalProcessText(id))}
+// interruptErrorWords are the words of the result of an interrupted
+// execute call with args when its outcome is unknown.
+func interruptErrorWords(id ToolCallIdentity, args ExecuteArgs) AgentErrorWords {
+	effect := "the command may still be running"
+	if args.RunsInBackground() {
+		effect = "the command may be running in the background"
+	}
+	return AgentErrorWords{
+		Action:          "cancel process",
+		Existing:        fmt.Sprintf("a process for this tool call (process ID %s)", id.UUID()),
+		Effect:          effect,
+		Check:           checkOrSignalProcessText(id),
+		RestartedEffect: "the command may have run before the restart",
+		RestartedCheck:  "Check the workspace state before running it again.",
+	}
+}
+
+// recordedStartErrorResult returns the result of an execute call with
+// args whose start request failed, from the agent's recorded answer to
+// it. ok is false when the recorded answer is not an error, which a start
+// that created no process does not produce.
+func recordedStartErrorResult(resp workspacesdk.CancelToolCallResponse, args ExecuteArgs) (result ExecuteResult, ok bool) {
+	if resp.StatusCode < http.StatusBadRequest {
+		return ExecuteResult{}, false
+	}
+	action := "start process"
+	if args.RunsInBackground() {
+		action = "start background process"
+	}
+	msg := http.StatusText(resp.StatusCode)
+	var body codersdk.Response
+	if json.Unmarshal(resp.Body, &body) == nil && body.Message != "" {
+		msg = body.Message
+		if body.Detail != "" {
+			msg += ": " + body.Detail
+		}
+	}
+	return ExecuteResult{Error: enrichStartError(fmt.Sprintf("%s: %s", action, msg))}, true
+}
+
+// toolCallProcessOutput converts a tool call's process state to the
+// output response the execute result builders take.
+func toolCallProcessOutput(proc *workspacesdk.ToolCallProcess) workspacesdk.ProcessOutputResponse {
+	return workspacesdk.ProcessOutputResponse{
+		Running:   proc.Running,
+		Output:    proc.Output,
+		Truncated: proc.Truncated,
+		ExitCode:  proc.ExitCode,
+	}
 }
 
 // checkOrSignalProcessText tells the model how to find or stop the tool
@@ -515,43 +512,15 @@ func waitForToolCallProcess(
 	timeout time.Duration,
 ) ExecuteResult {
 	waitStart := time.Now()
-	ageMs := max(resp.AgeMs, 0)
-	var result ExecuteResult
-	if remaining := timeout - time.Duration(ageMs)*time.Millisecond; remaining > 0 {
-		waitCtx, cancel := context.WithTimeout(ctx, remaining)
-		defer cancel()
-		result = waitForProcess(waitCtx, ctx, conn, resp.ID, timeout)
-	} else {
-		result = processSnapshotResult(ctx, conn, resp.ID, timeout)
-	}
-	// Time since the process started, as reported by the agent, plus this attempt's wait.
-	result.WallDurationMs = ageMs + time.Since(waitStart).Milliseconds()
-	return result
-}
-
-// processSnapshotResult reads a process past its execute deadline once
-// without blocking.
-func processSnapshotResult(
-	ctx context.Context,
-	conn workspacesdk.AgentConn,
-	processID string,
-	timeout time.Duration,
-) ExecuteResult {
-	snapshotCtx, cancel := context.WithTimeout(ctx, snapshotTimeout)
+	runAge := max(resp.RunAge, 0)
+	// With no time left, waitCtx has already expired and waitForProcess
+	// reads the process once.
+	waitCtx, cancel := context.WithTimeout(ctx, timeout-runAge)
 	defer cancel()
-	resp, err := conn.ProcessOutput(snapshotCtx, processID, nil)
-	if err != nil {
-		return ExecuteResult{
-			Success:             false,
-			ExitCode:            -1,
-			Error:               fmt.Sprintf("command timed out after %s; failed to get output: %v", timeout, err),
-			BackgroundProcessID: processID,
-		}
-	}
-	if resp.Running {
-		return timedOutRunningResult(resp, timeout, processID)
-	}
-	return completedResult(resp)
+	result := waitForProcess(waitCtx, ctx, conn, resp.ID, timeout)
+	// Time since the process started, as reported by the agent, plus this attempt's wait.
+	result.WallDurationMs = (runAge + time.Since(waitStart)).Milliseconds()
+	return result
 }
 
 // timedOutRunningResult reports partial output plus the process ID, so
@@ -606,10 +575,14 @@ func waitForProcess(
 	timeout time.Duration,
 ) ExecuteResult {
 	// Block until the process exits or the context is
-	// canceled.
-	resp, err := conn.ProcessOutput(ctx, processID, &workspacesdk.ProcessOutputOptions{
-		Wait: true,
-	})
+	// canceled. An expired context skips to the snapshot below.
+	var resp workspacesdk.ProcessOutputResponse
+	err := ctx.Err()
+	if err == nil {
+		resp, err = conn.ProcessOutput(ctx, processID, &workspacesdk.ProcessOutputOptions{
+			Wait: true,
+		})
+	}
 	if err != nil {
 		origErr := err
 		timedOut := ctx.Err() != nil

@@ -23,7 +23,6 @@ import (
 	"github.com/coder/coder/v2/coderd/x/chatd/chattool"
 	"github.com/coder/coder/v2/coderd/x/chatd/messagepartbuffer"
 	"github.com/coder/coder/v2/codersdk"
-	"github.com/coder/coder/v2/codersdk/workspacesdk"
 	"github.com/coder/quartz"
 )
 
@@ -191,10 +190,10 @@ type interruptionOutcome struct {
 	Kind runnerActionKind
 }
 
-// interruptCancelTimeout bounds the requests an interrupt sends to the
-// workspace agent for execute calls. It exists only so an unreachable
-// agent yields an unknown result: interrupt latency is not a concern,
-// and waiting for the agent's answer reports the real outcome.
+// interruptCancelTimeout bounds the cancel requests an interrupt sends
+// to the workspace agent. It exists only so an unreachable agent yields
+// an unknown result: interrupt latency is not a concern, and waiting for
+// the agent's answer reports the real outcome.
 const interruptCancelTimeout = time.Minute
 
 type taskStarter struct {
@@ -324,9 +323,9 @@ func (s *taskStarter) StartInterrupt(ctx context.Context, input chatWorkerTaskSt
 	}
 	// The transaction's history version fence guarantees it sees the same
 	// unresolved tool calls as messages.
-	interruptResults, err := s.interruptToolCalls(ctx, chat, messages)
+	executeResults, err := s.interruptExecuteCalls(ctx, chat, messages)
 	if err != nil {
-		return xerrors.Errorf("interrupt tool calls: %w", err)
+		return xerrors.Errorf("interrupt execute calls: %w", err)
 	}
 
 	var committed database.Chat
@@ -338,7 +337,7 @@ func (s *taskStarter) StartInterrupt(ctx context.Context, input chatWorkerTaskSt
 		messages := partialMessages
 		// Reuse the captured interrupt instant so database delay does not
 		// inflate billing.
-		committedCancels, err := committedPendingLocalToolCancellationMessages(ctx, store, chat, interruptedAt, toolCompletions, interruptResults)
+		committedCancels, err := committedPendingLocalToolCancellationMessages(ctx, store, chat, interruptedAt, toolCompletions, executeResults)
 		if err != nil {
 			return xerrors.Errorf("committed pending local tool cancellation messages: %w", err)
 		}
@@ -718,25 +717,24 @@ func dynamicToolNamesFromChat(chat database.Chat) map[string]bool {
 	return names
 }
 
-// interruptToolCalls ends the unresolved foreground execute, edit_files,
-// and write_file calls in messages, looks up the processes of the
-// background execute calls, and returns their results by provider tool
-// call ID. A call without an entry keeps the generic interrupted result.
-// The message part buffer plays no part: the canceled generation
-// goroutine records completions and publishes results before interrupt
-// handling reads them, and it holds nothing after an ownership change.
-func (s *taskStarter) interruptToolCalls(
+// interruptExecuteCalls cancels the unresolved execute calls in messages
+// on the workspace agent and returns their results by provider tool call
+// ID. A call without an entry keeps the generic interrupted result. The
+// message part buffer plays no part: the canceled generation goroutine
+// records completions and publishes results before interrupt handling
+// reads them, and it holds nothing after an ownership change.
+func (s *taskStarter) interruptExecuteCalls(
 	ctx context.Context,
 	chat database.Chat,
 	messages []database.ChatMessage,
-) (map[string]interruptResult, error) {
+) (map[string]json.RawMessage, error) {
 	toolCallMsg, localCalls, _, err := unresolvedToolCallsFromHistory(messages, dynamicToolNamesFromChat(chat))
 	if err != nil {
 		return nil, err
 	}
-	calls := interruptCalls(localCalls)
+	calls := interruptedExecuteCalls(localCalls)
 	if len(calls) == 0 {
-		return map[string]interruptResult{}, nil
+		return map[string]json.RawMessage{}, nil
 	}
 	dbNow, err := s.opts.Store.GetDatabaseNow(ctx)
 	if err != nil {
@@ -749,9 +747,8 @@ func (s *taskStarter) interruptToolCalls(
 	timer := s.opts.Clock.AfterFunc(interruptCancelTimeout, cancel, "chatworker", "interrupt_cancel")
 	defer timer.Stop()
 
-	results := make([]interruptResult, len(calls))
+	results := make([]chattool.ExecuteResult, len(calls))
 	answered := make([]bool, len(calls))
-	errs := make([]error, len(calls))
 	identities := make([]chattool.ToolCallIdentity, len(calls))
 	for i, call := range calls {
 		identities[i] = chattool.ToolCallIdentity{
@@ -765,149 +762,64 @@ func (s *taskStarter) interruptToolCalls(
 	defer workspaceCtx.close()
 	conn, err := workspaceCtx.getWorkspaceConn(agentCtx)
 	if err != nil {
-		// Each call decides whether anything it did can have survived
-		// without a reachable agent.
-		for i, call := range calls {
-			results[i], answered[i], errs[i] = call.unreachableResult(identities[i], err)
+		for i, identity := range identities {
+			results[i], answered[i] = chattool.InterruptExecuteUnreachable(identity, calls[i].args, err)
 		}
 	} else {
 		var wg sync.WaitGroup
-		for i, call := range calls {
+		for i, identity := range identities {
 			wg.Go(func() {
-				results[i], answered[i], errs[i] = call.interrupt(agentCtx, conn, identities[i])
+				results[i], answered[i] = chattool.InterruptExecute(agentCtx, conn, identity, calls[i].args)
 			})
 		}
 		wg.Wait()
 	}
 	// Answers to requests the task's context ended are not the agent's.
 	if ctx.Err() != nil {
-		return nil, errors.Join(errTaskExpectedExit, xerrors.Errorf("interrupt tool calls: %w", ctx.Err()))
-	}
-	if err := errors.Join(errs...); err != nil {
-		return nil, err
+		return nil, errors.Join(errTaskExpectedExit, xerrors.Errorf("interrupt execute calls: %w", ctx.Err()))
 	}
 
-	byID := make(map[string]interruptResult, len(calls))
+	payloads := make(map[string]json.RawMessage, len(calls))
 	for i, call := range calls {
-		if answered[i] {
-			byID[call.toolCallID] = results[i]
+		if !answered[i] {
+			continue
 		}
+		payload, err := json.Marshal(results[i])
+		if err != nil {
+			return nil, xerrors.Errorf("marshal interrupted execute result: %w", err)
+		}
+		payloads[call.toolCallID] = payload
 	}
-	return byID, nil
+	return payloads, nil
 }
 
-// interruptResult is the result interrupt handling commits for a tool
-// call from the workspace agent's answer.
-type interruptResult struct {
-	payload json.RawMessage
-	isError bool
-}
-
-// executeInterruptResult returns the interrupt result of an execute call,
-// stored as generation stores the execute tool's response. Execute
-// results are never error results, so the model sees every field.
-func executeInterruptResult(call interruptCall, result chattool.ExecuteResult) (interruptResult, error) {
-	payload, err := json.Marshal(result)
-	if err != nil {
-		return interruptResult{}, xerrors.Errorf("marshal interrupted execute result: %w", err)
-	}
-	return toolResponseInterruptResult(call, fantasy.NewTextResponse(string(payload))), nil
-}
-
-// toolResponseInterruptResult returns the interrupt result of call from
-// the response its tool would have returned, stored as generation stores
-// a tool response.
-func toolResponseInterruptResult(call interruptCall, resp fantasy.ToolResponse) interruptResult {
-	// Generation cuts each result to a budget derived from the model's
-	// context window. Interrupt handling does not load the chat's model,
-	// so it uses the default budget, the one generation uses when the
-	// context window is unknown.
-	content, _ := chatloop.TruncateToolResult(resp.Content, 0)
-	var output fantasy.ToolResultOutputContent = fantasy.ToolResultOutputContentText{Text: content}
-	if resp.IsError {
-		output = fantasy.ToolResultOutputContentError{Error: xerrors.New(content)}
-	}
-	part := chatprompt.PartFromContent(fantasy.ToolResultContent{
-		ToolCallID: call.toolCallID,
-		ToolName:   call.toolName,
-		Result:     output,
-	})
-	return interruptResult{payload: part.Result, isError: part.IsError}
-}
-
-// interruptCall is an unresolved tool call that interrupt handling asks
-// the workspace agent about: an execute call, or an edit_files or
-// write_file call.
-type interruptCall struct {
+// interruptedExecuteCall is an unresolved execute call that interrupt
+// handling cancels.
+type interruptedExecuteCall struct {
 	toolCallID string
-	toolName   string
-	// background is set for an execute call that runs in the background.
+	args       chattool.ExecuteArgs
+	// stop is what the cancel request asks for, which calls sharing a
+	// provider tool call ID must agree on.
+	stop interruptStop
+}
+
+type interruptStop struct {
 	background bool
-	// timeout is the effective timeout of a foreground execute call.
-	timeout time.Duration
+	runAge     time.Duration
 }
 
-// interrupt asks the workspace agent about call and returns its result.
-// ok is false when the call keeps the generic interrupted result.
-func (call interruptCall) interrupt(ctx context.Context, conn workspacesdk.AgentConn, id chattool.ToolCallIdentity) (result interruptResult, ok bool, err error) {
-	if call.toolName != chattool.ExecuteToolName {
-		resp, ok := chattool.InterruptFileToolCall(ctx, conn, call.toolName, id)
-		if !ok {
-			return interruptResult{}, false, nil
-		}
-		return toolResponseInterruptResult(call, resp), true, nil
-	}
-	var execResult chattool.ExecuteResult
-	if call.background {
-		execResult, ok = chattool.InterruptBackgroundExecute(ctx, conn, id)
-	} else {
-		execResult, ok = chattool.InterruptExecute(ctx, conn, id, call.timeout)
-	}
-	if !ok {
-		return interruptResult{}, false, nil
-	}
-	result, err = executeInterruptResult(call, execResult)
-	return result, true, err
-}
-
-// unreachableResult returns the result of call when no connection to the
-// workspace agent could be made. ok is false when the call keeps the
-// generic interrupted result: an execute call without a workspace agent,
-// whose process cannot be running, and a file tool call whose change
-// cannot have survived. A stopped workspace keeps its disk, so a file
-// tool call without an agent gets an unknown result.
-func (call interruptCall) unreachableResult(id chattool.ToolCallIdentity, connErr error) (result interruptResult, ok bool, err error) {
-	if call.toolName != chattool.ExecuteToolName {
-		resp, ok := chattool.FileToolCallConnErrorResult(call.toolName, connErr)
-		if !ok {
-			return interruptResult{}, false, nil
-		}
-		return toolResponseInterruptResult(call, resp), true, nil
-	}
-	if chattool.HasNoWorkspaceAgent(connErr) {
-		return interruptResult{}, false, nil
-	}
-	execResult := chattool.AgentUnreachableExecuteResult(id, connErr)
-	if call.background {
-		execResult = chattool.AgentUnreachableBackgroundExecuteResult(id, connErr)
-	}
-	result, err = executeInterruptResult(call, execResult)
-	return result, true, err
-}
-
-// interruptCalls returns the calls in localCalls that interrupt handling
-// asks the workspace agent about. Interrupt results are keyed by provider
-// tool call ID, so two calls sharing one cannot get different results:
-// such an ID is returned once, and only when every call with it is
-// handled the same way.
-func interruptCalls(localCalls []fantasy.ToolCallContent) []interruptCall {
-	byID := make(map[string]interruptCall)
+// interruptedExecuteCalls returns the execute calls in localCalls that
+// interrupt handling cancels. An ID shared by several calls is returned
+// once, and only when every call with it asks for the same stop, because
+// they share one tool call UUID.
+func interruptedExecuteCalls(localCalls []fantasy.ToolCallContent) []interruptedExecuteCall {
+	byID := make(map[string]interruptedExecuteCall)
 	skip := make(map[string]bool)
 	var ids []string
 	for _, call := range localCalls {
-		classified, ok := classifyInterruptCall(call)
+		classified, ok := classifyExecuteCall(call)
 		prev, seen := byID[call.ToolCallID]
-		if !ok || (seen && prev != classified) {
+		if !ok || (seen && prev.stop != classified.stop) {
 			skip[call.ToolCallID] = true
 		}
 		if !seen {
@@ -915,7 +827,7 @@ func interruptCalls(localCalls []fantasy.ToolCallContent) []interruptCall {
 			ids = append(ids, call.ToolCallID)
 		}
 	}
-	var calls []interruptCall
+	var calls []interruptedExecuteCall
 	for _, id := range ids {
 		if !skip[id] {
 			calls = append(calls, byID[id])
@@ -924,36 +836,30 @@ func interruptCalls(localCalls []fantasy.ToolCallContent) []interruptCall {
 	return calls
 }
 
-// classifyInterruptCall returns how interrupt handling acts on call.
-// Every edit_files and write_file call qualifies: they have no deadline,
-// and cancel waits for an edit in progress, so the answer is the edit's
-// outcome. ok is false for other tools, for unparsable execute arguments,
-// and for a foreground execute call with an invalid timeout, for which
-// the tool starts no process.
-func classifyInterruptCall(call fantasy.ToolCallContent) (interruptCall, bool) {
-	switch call.ToolName {
-	case chattool.EditFilesToolName, chattool.WriteFileToolName:
-		return interruptCall{toolCallID: call.ToolCallID, toolName: call.ToolName}, true
-	case chattool.ExecuteToolName:
-	default:
-		return interruptCall{}, false
+// classifyExecuteCall returns how interrupt handling cancels call. ok is
+// false for any other tool, for unparsable arguments, and for arguments
+// for which the tool starts no process.
+func classifyExecuteCall(call fantasy.ToolCallContent) (interruptedExecuteCall, bool) {
+	if call.ToolName != chattool.ExecuteToolName {
+		return interruptedExecuteCall{}, false
 	}
 	var args chattool.ExecuteArgs
 	if err := json.Unmarshal([]byte(call.Input), &args); err != nil {
-		return interruptCall{}, false
+		return interruptedExecuteCall{}, false
 	}
-	if args.RunsInBackground() {
-		return interruptCall{toolCallID: call.ToolCallID, toolName: call.ToolName, background: true}, true
+	runAge, ok := args.InterruptStopRunAge()
+	if !ok {
+		return interruptedExecuteCall{}, false
 	}
-	timeout, err := args.EffectiveTimeout(chattool.ExecuteDefaultTimeout)
-	if err != nil {
-		return interruptCall{}, false
-	}
-	return interruptCall{toolCallID: call.ToolCallID, toolName: call.ToolName, timeout: timeout}, true
+	return interruptedExecuteCall{
+		toolCallID: call.ToolCallID,
+		args:       args,
+		stop:       interruptStop{background: args.RunsInBackground(), runAge: runAge},
+	}, true
 }
 
 // committedPendingLocalToolCancellationMessages returns a result for
-// every unresolved local tool call: the entry of interruptResults for its
+// every unresolved local tool call: the entry of executeResults for its
 // provider tool call ID, or the generic interrupted result.
 func committedPendingLocalToolCancellationMessages(
 	ctx context.Context,
@@ -961,7 +867,7 @@ func committedPendingLocalToolCancellationMessages(
 	chat database.Chat,
 	interruptedAt time.Time,
 	toolCompletions map[int]messagepartbuffer.ToolCompletion,
-	interruptResults map[string]interruptResult,
+	executeResults map[string]json.RawMessage,
 ) ([]chatstate.Message, error) {
 	messages, err := store.GetChatMessagesByChatID(ctx, database.GetChatMessagesByChatIDParams{
 		ChatID:  chat.ID,
@@ -980,9 +886,8 @@ func committedPendingLocalToolCancellationMessages(
 	var intervals []chatloop.BilledInterval
 	result := make([]chatstate.Message, 0, len(localCalls))
 	for i, call := range localCalls {
-		interrupted, ok := interruptResults[call.ToolCallID]
-		payload, isError := interrupted.payload, interrupted.isError
-		if !ok {
+		payload, isError := executeResults[call.ToolCallID], false
+		if payload == nil {
 			payload, err = json.Marshal(map[string]string{"error": interruptedToolResultErrorMessage})
 			if err != nil {
 				return nil, xerrors.Errorf("marshal interrupted tool result: %w", err)

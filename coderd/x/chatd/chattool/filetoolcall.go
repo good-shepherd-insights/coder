@@ -99,53 +99,6 @@ func agentRestartedFileResult(text fileToolText) fantasy.ToolResponse {
 		"the "+text.change+" may have been applied before the restart", checkFileText))
 }
 
-// InterruptFileToolCall asks the workspace agent to cancel the edit_files
-// or write_file tool call id, named toolName, and returns the result the
-// tool call gets. The agent cannot stop an edit in progress, so it waits
-// for it: a started call gets the result the tool returns for the
-// agent's recorded answer. ok is false when the answer does not describe
-// the tool call: an error answer other than agent_started_after_tool_call,
-// including the 404 of an agent without the cancel route.
-func InterruptFileToolCall(ctx context.Context, conn workspacesdk.AgentConn, toolName string, id ToolCallIdentity) (result fantasy.ToolResponse, ok bool) {
-	cancelCtx := workspacesdk.WithToolCall(ctx, id.AgentToolCall())
-	var (
-		resp workspacesdk.CancelFileToolCallResponse
-		err  error
-	)
-	if toolName == WriteFileToolName {
-		resp, err = conn.CancelWriteFile(cancelCtx, id.UUID())
-	} else {
-		resp, err = conn.CancelEditFiles(cancelCtx, id.UUID())
-	}
-	text := fileToolTexts(toolName)
-	if err != nil {
-		return canceledFileToolCallErrorResult(text, err)
-	}
-	if !resp.Started {
-		return fantasy.NewTextErrorResponse(fmt.Sprintf("not applied: the %s was canceled before the workspace agent received it.", text.change)), true
-	}
-	if toolName == WriteFileToolName {
-		return writeFileResult(resp.WriteFileResult()), true
-	}
-	return editFilesResult(resp.EditFilesResult()), true
-}
-
-// canceledFileToolCallErrorResult converts a cancel request error for a
-// file tool call into its result.
-func canceledFileToolCallErrorResult(text fileToolText, err error) (result fantasy.ToolResponse, ok bool) {
-	switch kind, code := ClassifyAgentError(err); {
-	case kind == AgentErrorRefused && code == workspacesdk.ToolCallErrorAgentStartedAfterToolCall:
-		return agentRestartedFileResult(text), true
-	case kind == AgentErrorRefused, kind == AgentErrorResponse:
-		return fantasy.ToolResponse{}, false
-	case kind == AgentErrorUnreachable:
-		return agentUnreachableFileResult(text, err), true
-	default:
-		return fantasy.NewTextErrorResponse(UnknownOutcome(AgentUnreadableReason(err),
-			"the "+text.change+" may have been applied", checkFileText)), true
-	}
-}
-
 // FileToolCallConnErrorResult returns the result of an interrupted
 // edit_files or write_file call, named toolName, when no connection to
 // the workspace agent could be made to cancel it. ok is false when no
