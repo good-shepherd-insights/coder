@@ -28,11 +28,14 @@ const (
 	// CoderToolCallAgeMsHeader carries ToolCall.Age as a non-negative
 	// decimal number of milliseconds.
 	CoderToolCallAgeMsHeader = "Coder-Tool-Call-Age-Ms"
-	// CoderToolCallRunAgeMsHeader is set by the agent on every answered
-	// request with tool call headers: the time since the agent first ran
-	// the tool call's request, as a non-negative decimal number of
-	// milliseconds. It is a header because a repeated request gets the
-	// recorded body, which cannot carry a live value.
+	// CoderToolCallRunAgeMsHeader is set by the agent on every recorded
+	// or replayed response to a request with tool call headers, and on
+	// cancel answers for a tool call that ran: the time since the agent
+	// first ran the tool call's request, as a non-negative decimal number
+	// of milliseconds. 409 answers and cancel answers for a tool call the
+	// agent never received or recorded as canceled do not carry it. It is
+	// a header because a repeated request gets the recorded body, which
+	// cannot carry a live value.
 	CoderToolCallRunAgeMsHeader = "Coder-Tool-Call-Run-Age-Ms"
 )
 
@@ -129,8 +132,8 @@ func runAgeFromHeader(h http.Header) time.Duration {
 // uuid5(NAMESPACE_URL, "https://coder.com/workspace-agent/tool-call").
 var ToolCallUUIDNamespace = uuid.MustParse("c5773f4c-0b3f-57bc-9147-36daf7921a1b")
 
-// ToolCallUUID returns the process ID, and the ID in cancel routes, for
-// a tool call. chatd and the workspace agent both derive it, so the
+// ToolCallUUID returns the process ID, and the ID in the cancel route,
+// for a tool call. chatd and the workspace agent both derive it, so the
 // encoding must not change: UUIDv5 in ToolCallUUIDNamespace of the 16
 // chat ID bytes, the big-endian uint64 message ID, and the raw provider
 // tool call ID bytes.
