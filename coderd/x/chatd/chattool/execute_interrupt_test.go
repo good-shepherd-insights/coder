@@ -153,6 +153,17 @@ func TestInterruptExecute(t *testing.T) {
 			wantBackground: true,
 		},
 		{
+			// A trailing "&" runs the call in the background, so its
+			// cancel never stops the process either.
+			name:  "TrailingAmpersandBackgroundRunning",
+			input: `{"command":"make dev &"}`,
+			resp: workspacesdk.CancelToolCallResponse{Started: true, Process: &workspacesdk.ToolCallProcess{
+				Running: true, RunAgeMs: 60_000,
+			}},
+			want:           chattool.ExecuteResult{Success: true, Backgrounded: true},
+			wantBackground: true,
+		},
+		{
 			name:  "BackgroundExited",
 			input: background,
 			resp: workspacesdk.CancelToolCallResponse{Started: true, Process: &workspacesdk.ToolCallProcess{
@@ -171,7 +182,9 @@ func TestInterruptExecute(t *testing.T) {
 				ContentType: "application/json",
 				Body:        []byte(`{"message":"Failed to start process.","detail":"fork failed"}`),
 			},
-			wantError: []string{"start process: Failed to start process.: fork failed"},
+			// The text of the live start error, without the request's
+			// method and agent URL.
+			wantError: []string{"start process: unexpected status code 500: Failed to start process.\n\tError: fork failed"},
 		},
 		{
 			name:  "BackgroundStartFailed",
@@ -181,7 +194,36 @@ func TestInterruptExecute(t *testing.T) {
 				StatusCode: http.StatusInternalServerError,
 				Body:       []byte("not json"),
 			},
-			wantError: []string{"start background process: Internal Server Error"},
+			wantError: []string{"start background process: unexpected status code 500: unexpected non-JSON response \"\"\n\tError: not json"},
+		},
+		{
+			// The start succeeded, but the agent reported no process: the
+			// background process ID is still the tool call UUID.
+			name:  "BackgroundStartedWithoutProcess",
+			input: background,
+			resp: workspacesdk.CancelToolCallResponse{
+				Started:     true,
+				StatusCode:  http.StatusOK,
+				ContentType: "application/json",
+				Body:        []byte(`{"started":true}`),
+			},
+			want:           chattool.ExecuteResult{Success: true, Backgrounded: true},
+			wantBackground: true,
+		},
+		{
+			// The start succeeded, but the agent reported no process, so
+			// whether the command still runs is unknown.
+			name:     "ForegroundStartedWithoutProcess",
+			input:    foreground,
+			wantStop: (2 * time.Hour).Milliseconds(),
+			resp: workspacesdk.CancelToolCallResponse{
+				Started:     true,
+				StatusCode:  http.StatusOK,
+				ContentType: "application/json",
+				Body:        []byte(`{"started":true}`),
+			},
+			wantError: []string{"outcome unknown: the workspace agent reported no process for this tool call", "the command may still be running"},
+			wantUUID:  true,
 		},
 		{
 			name:      "AgentStartedAfterToolCall",
