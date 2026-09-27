@@ -1350,7 +1350,8 @@ func TestInterruptTask_CancelsExecuteCallsInParallel(t *testing.T) {
 }
 
 // TestInterruptTask_CancelBoundYieldsUnknown shows that an agent that
-// never answers yields an unknown result once the bound passes.
+// never answers a cancel yields an unknown result once the agent answer
+// timeout passes, timed on the task's clock.
 func TestInterruptTask_CancelBoundYieldsUnknown(t *testing.T) {
 	t.Parallel()
 
@@ -1358,7 +1359,7 @@ func TestInterruptTask_CancelBoundYieldsUnknown(t *testing.T) {
 	callID := "call_" + uuid.NewString()
 	e := newExecuteInterrupt(t, f, []codersdk.ChatMessagePart{executeToolCall(callID, executeForeground)}, nil)
 	ctx := testutil.Context(t, testutil.WaitLong)
-	// Move the message part buffer off the mock clock, so the bound's
+	// Move the message part buffer off the mock clock, so the answer
 	// timer is the only event on it and one Advance reaches it. The
 	// buffer's cleanup ticker is the clock's only ticker, and it stops
 	// without tags.
@@ -1370,7 +1371,7 @@ func TestInterruptTask_CancelBoundYieldsUnknown(t *testing.T) {
 	t.Cleanup(buffer.Close)
 	e.starter.opts.MessagePartBuffer = buffer
 
-	bound := e.clock.Trap().AfterFunc("chatworker", "interrupt_cancel")
+	bound := e.clock.Trap().AfterFunc("chattool", "agent-answer")
 	defer bound.Close()
 	arrived := make(chan struct{})
 	e.conn.EXPECT().CancelToolCall(gomock.Any(), e.processID(callID), executeForegroundStop).
@@ -1387,7 +1388,7 @@ func TestInterruptTask_CancelBoundYieldsUnknown(t *testing.T) {
 		if !assert.NoError(t, err) {
 			return
 		}
-		assert.Equal(t, interruptCancelTimeout, call.Duration)
+		assert.Equal(t, chattool.AgentAnswerTimeout, call.Duration)
 		if !assert.NoError(t, call.Release(ctx)) {
 			return
 		}
@@ -1396,12 +1397,12 @@ func TestInterruptTask_CancelBoundYieldsUnknown(t *testing.T) {
 		case <-ctx.Done():
 			return
 		}
-		assert.NoError(t, e.clock.Advance(interruptCancelTimeout).Wait(ctx))
+		assert.NoError(t, e.clock.Advance(chattool.AgentAnswerTimeout).Wait(ctx))
 	}()
 
 	result := requireExecuteResult(t, singleToolResult(t, e.interrupt(t, f), callID))
 	<-advanced
-	assert.Contains(t, result.Error, "outcome unknown: the workspace agent could not be reached")
+	assert.Contains(t, result.Error, "outcome unknown: "+chattool.AgentNoAnswerReason)
 	assert.Contains(t, result.Error, e.processID(callID))
 }
 

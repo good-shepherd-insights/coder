@@ -190,12 +190,6 @@ type interruptionOutcome struct {
 	Kind runnerActionKind
 }
 
-// interruptCancelTimeout bounds the cancel requests an interrupt sends
-// to the workspace agent. It exists only so an unreachable agent yields
-// an unknown result: interrupt latency is not a concern, and waiting for
-// the agent's answer reports the real outcome.
-const interruptCancelTimeout = time.Minute
-
 type taskStarter struct {
 	server                   *Server
 	opts                     chatWorkerOptions
@@ -743,11 +737,6 @@ func (s *taskStarter) interruptToolCalls(
 	}
 	age := chattool.NewToolCallAge(s.opts.Clock, dbNow, toolCallMsg.createdAt)
 
-	agentCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	timer := s.opts.Clock.AfterFunc(interruptCancelTimeout, cancel, "chatworker", "interrupt_cancel")
-	defer timer.Stop()
-
 	responses := make([]fantasy.ToolResponse, len(calls))
 	answered := make([]bool, len(calls))
 	identities := make([]chattool.ToolCallIdentity, len(calls))
@@ -761,7 +750,9 @@ func (s *taskStarter) interruptToolCalls(
 	}
 	workspaceCtx := newTurnWorkspaceContext(s.server, chat)
 	defer workspaceCtx.close()
-	conn, err := workspaceCtx.getWorkspaceConn(agentCtx)
+	// The dial ends after the server's dial timeout, and each cancel
+	// request after chattool.AgentAnswerTimeout.
+	conn, err := workspaceCtx.getWorkspaceConn(ctx)
 	if err != nil {
 		for i, call := range calls {
 			responses[i], answered[i] = call.cancel.Unreachable(identities[i], err)
@@ -770,7 +761,7 @@ func (s *taskStarter) interruptToolCalls(
 		var wg sync.WaitGroup
 		for i, call := range calls {
 			wg.Go(func() {
-				responses[i], answered[i] = call.cancel.Interrupt(agentCtx, conn, identities[i])
+				responses[i], answered[i] = call.cancel.Interrupt(ctx, s.opts.Clock, conn, identities[i])
 			})
 		}
 		wg.Wait()

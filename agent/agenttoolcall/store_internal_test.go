@@ -21,8 +21,8 @@ func TestNegativeAgeCountsAsZero(t *testing.T) {
 	clock.Advance(time.Second).MustWait(testutil.Context(t, testutil.WaitShort))
 	key := Key{ChatID: uuid.New(), MessageID: 1, ToolCallID: "call"}
 
-	_, _, err := s.begin(key, -time.Hour, [sha256.Size]byte{})
+	_, _, err := s.begin(key, clock.Now(), -time.Hour, [sha256.Size]byte{})
 	require.ErrorIs(t, err, errAgentStartedAfterToolCall)
-	_, _, err = s.cancel(key, -time.Hour)
+	_, _, err = s.cancel(key, clock.Now(), -time.Hour)
 	require.ErrorIs(t, err, errAgentStartedAfterToolCall)
 }

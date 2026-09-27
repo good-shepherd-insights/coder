@@ -1,9 +1,11 @@
 package workspacesdk
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	neturl "net/url"
@@ -17,6 +19,8 @@ import (
 	"golang.org/x/xerrors"
 
 	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/coder/v2/testutil"
+	"github.com/coder/quartz"
 )
 
 func TestReadToolCallError(t *testing.T) {
@@ -113,6 +117,108 @@ func TestReadToolCallError(t *testing.T) {
 		defer wantRes.Body.Close()
 		want := codersdk.ReadBodyAsError(wantRes)
 		assert.Equal(t, want.Error(), got.Error())
+	})
+}
+
+func TestDoWithToolCall(t *testing.T) {
+	t.Parallel()
+
+	// The request host does not resolve, so a response proves the
+	// request went over the connection dial returned.
+	const unreachableURL = "http://agent.invalid:4/api/v0/processes/start"
+
+	t.Run("age includes connect time", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t, testutil.WaitShort)
+		gotAge := make(chan string, 1)
+		srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			gotAge <- r.Header.Get(CoderToolCallAgeMsHeader)
+			rw.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(srv.Close)
+
+		clock := quartz.NewMock(t)
+		dials := 0
+		dial := func(ctx context.Context) (net.Conn, error) {
+			dials++
+			// Waiting for a restarting agent.
+			clock.Advance(5 * time.Second).MustWait(ctx)
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Listener.Addr().String())
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, unreachableURL, nil)
+		require.NoError(t, err)
+
+		res, err := doWithToolCall(req, ToolCall{MessageID: 1, ID: "call", Age: time.Second}, clock, dial)
+		require.NoError(t, err)
+		defer res.Body.Close()
+		require.Equal(t, http.StatusOK, res.StatusCode)
+		require.Equal(t, 1, dials)
+		require.Equal(t, "6000", testutil.RequireReceive(ctx, t, gotAge))
+	})
+
+	t.Run("dial error", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t, testutil.WaitShort)
+		dialErr := xerrors.New("agent not reachable")
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, unreachableURL, nil)
+		require.NoError(t, err)
+
+		res, err := doWithToolCall(req, ToolCall{MessageID: 1, ID: "call"}, quartz.NewMock(t), func(context.Context) (net.Conn, error) {
+			return nil, dialErr
+		})
+		if res != nil {
+			_ = res.Body.Close()
+		}
+		require.ErrorIs(t, err, dialErr)
+		// Callers classify a *url.Error as a transport failure, as they
+		// do for a dial inside http.Client.Do.
+		var urlErr *neturl.Error
+		require.ErrorAs(t, err, &urlErr)
+		require.Equal(t, "Post", urlErr.Op)
+		require.Empty(t, req.Header.Values(CoderToolCallAgeMsHeader))
+	})
+
+	t.Run("unused connection is closed", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t, testutil.WaitShort)
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = ln.Close() })
+		accepted := make(chan net.Conn, 1)
+		go func() {
+			conn, err := ln.Accept()
+			if assert.NoError(t, err) {
+				accepted <- conn
+			}
+		}()
+
+		reqCtx, cancel := context.WithCancel(ctx)
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			conn, err := d.DialContext(ctx, "tcp", ln.Addr().String())
+			// The request ends after the connection is established.
+			cancel()
+			return conn, err
+		}
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, unreachableURL, nil)
+		require.NoError(t, err)
+
+		res, err := doWithToolCall(req, ToolCall{MessageID: 1, ID: "call"}, quartz.NewMock(t), dial)
+		if res != nil {
+			_ = res.Body.Close()
+		}
+		require.ErrorIs(t, err, context.Canceled)
+		// The transport may have written part of the request before it
+		// saw the cancel; either way the connection ends.
+		server := testutil.RequireReceive(ctx, t, accepted)
+		defer server.Close()
+		require.NoError(t, server.SetReadDeadline(time.Now().Add(testutil.WaitShort)))
+		_, err = io.Copy(io.Discard, server)
+		require.NoError(t, err)
 	})
 }
 

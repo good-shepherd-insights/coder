@@ -113,7 +113,7 @@ func TestInterruptedCall(t *testing.T) {
 					return tt.resp, nil
 				})
 
-			resp, ok := call.Interrupt(testutil.Context(t, testutil.WaitShort), conn, identity)
+			resp, ok := call.Interrupt(testutil.Context(t, testutil.WaitShort), nil, conn, identity)
 			require.True(t, ok)
 			// Execute results are never error results, so the model sees
 			// every field.

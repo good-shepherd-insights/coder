@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -176,8 +177,13 @@ func TestExecuteToolCall(t *testing.T) {
 			check: func(t *testing.T, result chattool.ExecuteResult, processID string) {
 				assert.False(t, result.Success)
 				assert.Equal(t, -1, result.ExitCode)
-				assert.Contains(t, result.Error, "command timed out after 10m0s")
+				// The wait was cut at the deadline, so the process may have
+				// exited before it; the result must not claim a timeout.
+				assert.Contains(t, result.Error, "outcome unknown")
+				assert.Contains(t, result.Error, "not received within 10m0s")
 				assert.Contains(t, result.Error, "connection reset")
+				assert.Contains(t, result.Error, processID)
+				assert.NotContains(t, result.Error, "timed out")
 				assert.Equal(t, processID, result.BackgroundProcessID)
 			},
 		},
@@ -495,6 +501,140 @@ func TestExecuteToolCallNoConnection(t *testing.T) {
 			})
 			require.NoError(t, err)
 			tt.check(t, resp, workspacesdk.ToolCallUUID(identity.ChatID, identity.MessageID, identity.ToolCallID).String())
+		})
+	}
+}
+
+// TestExecuteToolCallAgentAnswerTimeout covers a start request the
+// workspace agent never answers: it ends after chattool.AgentAnswerTimeout
+// with an unknown outcome, unless the tool call's own context ended first
+// or the execute timeout is shorter.
+func TestExecuteToolCallAgentAnswerTimeout(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		noIdentity bool
+		input      string
+		// endTask cancels the tool call's context while the start
+		// request waits, instead of advancing the clock.
+		endTask bool
+		// executeTimeoutFirst leaves the clock alone: the execute
+		// timeout ends the start request first.
+		executeTimeoutFirst bool
+		check               func(t *testing.T, result chattool.ExecuteResult, processID string)
+	}{
+		{
+			name:  "Foreground",
+			input: `{"command":"make test","timeout":"20m"}`,
+			check: func(t *testing.T, result chattool.ExecuteResult, processID string) {
+				assert.False(t, result.Success)
+				assert.True(t, strings.HasPrefix(result.Error, "outcome unknown: the workspace agent did not answer within 1m0s, so "), result.Error)
+				assert.Contains(t, result.Error, "may have started")
+				assert.Contains(t, result.Error, processID)
+			},
+		},
+		{
+			name:  "Background",
+			input: `{"command":"make dev","run_in_background":true}`,
+			check: func(t *testing.T, result chattool.ExecuteResult, processID string) {
+				assert.False(t, result.Success)
+				assert.False(t, result.Backgrounded)
+				assert.True(t, strings.HasPrefix(result.Error, "outcome unknown: the workspace agent did not answer within 1m0s, so "), result.Error)
+				assert.Contains(t, result.Error, processID)
+			},
+		},
+		{
+			name:       "NoIdentity",
+			noIdentity: true,
+			input:      `{"command":"make dev","run_in_background":true}`,
+			check: func(t *testing.T, result chattool.ExecuteResult, _ string) {
+				assert.False(t, result.Success)
+				assert.Contains(t, result.Error, "start background process: ")
+				assert.Contains(t, result.Error, "did not answer within 1m0s")
+				assert.NotContains(t, result.Error, "outcome unknown")
+			},
+		},
+		{
+			// Nothing commits the result of an ended task, so it keeps
+			// today's text.
+			name:    "TaskEnded",
+			input:   `{"command":"make dev","run_in_background":true}`,
+			endTask: true,
+			check: func(t *testing.T, result chattool.ExecuteResult, _ string) {
+				assert.False(t, result.Success)
+				assert.Contains(t, result.Error, "start background process: ")
+				assert.NotContains(t, result.Error, "outcome unknown")
+				assert.NotContains(t, result.Error, "did not answer")
+			},
+		},
+		{
+			name:                "ExecuteTimeoutFirst",
+			input:               `{"command":"make test","timeout":"50ms"}`,
+			executeTimeoutFirst: true,
+			check: func(t *testing.T, result chattool.ExecuteResult, processID string) {
+				assert.False(t, result.Success)
+				assert.Contains(t, result.Error, "outcome unknown")
+				assert.Contains(t, result.Error, "could not be reached")
+				assert.NotContains(t, result.Error, "did not answer")
+				assert.Contains(t, result.Error, processID)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			testCtx := testutil.Context(t, testutil.WaitMedium)
+			taskCtx, endTask := context.WithCancel(testCtx)
+			defer endTask()
+			clock := quartz.NewMock(t)
+			trap := clock.Trap().AfterFunc("chattool", "agent-answer")
+			defer trap.Close()
+			dbNow := time.Now()
+			identity := chattool.ToolCallIdentity{
+				ChatID:     uuid.New(),
+				MessageID:  42,
+				ToolCallID: "call_" + uuid.NewString(),
+				Age:        chattool.NewToolCallAge(clock, dbNow, dbNow),
+			}
+			runCtx := taskCtx
+			if !tt.noIdentity {
+				runCtx = chattool.WithToolCallIdentity(taskCtx, identity)
+			}
+
+			ctrl := gomock.NewController(t)
+			mockConn := agentconnmock.NewMockAgentConn(ctrl)
+			// A connected agent that never answers: the request ends only
+			// when its context does, as the SDK reports it.
+			mockConn.EXPECT().
+				StartProcess(gomock.Any(), gomock.Any()).
+				DoAndReturn(func(ctx context.Context, _ workspacesdk.StartProcessRequest) (workspacesdk.StartProcessResponse, error) {
+					<-ctx.Done()
+					return workspacesdk.StartProcessResponse{}, xerrors.Errorf("do request: %w",
+						&url.Error{Op: "Post", URL: "http://agent/api/v0/processes/start", Err: ctx.Err()})
+				})
+			tool := chattool.Execute(chattool.ExecuteOptions{
+				GetWorkspaceConn: func(context.Context) (workspacesdk.AgentConn, error) { return mockConn, nil },
+				Clock:            clock,
+			})
+			done := make(chan fantasy.ToolResponse, 1)
+			go func() {
+				resp, err := tool.Run(runCtx, fantasy.ToolCall{ID: identity.ToolCallID, Name: "execute", Input: tt.input})
+				assert.NoError(t, err)
+				done <- resp
+			}()
+			trap.MustWait(testCtx).MustRelease(testCtx)
+			switch {
+			case tt.endTask:
+				endTask()
+			case !tt.executeTimeoutFirst:
+				clock.Advance(chattool.AgentAnswerTimeout).MustWait(testCtx)
+			}
+			resp := testutil.RequireReceive(testCtx, t, done)
+			var result chattool.ExecuteResult
+			require.NoError(t, json.Unmarshal([]byte(resp.Content), &result), resp.Content)
+			tt.check(t, result, workspacesdk.ToolCallUUID(identity.ChatID, identity.MessageID, identity.ToolCallID).String())
 		})
 	}
 }

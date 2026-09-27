@@ -294,7 +294,7 @@ func TestInterruptExecute(t *testing.T) {
 					return tt.resp, tt.err
 				})
 
-			result, ok := chattool.InterruptExecute(ctx, conn, identity, parseExecuteArgs(t, tt.input))
+			result, ok := chattool.InterruptExecute(ctx, nil, conn, identity, parseExecuteArgs(t, tt.input))
 			if tt.generic {
 				assert.False(t, ok)
 				return
@@ -325,9 +325,48 @@ func TestInterruptExecuteInvalidTimeout(t *testing.T) {
 	t.Parallel()
 
 	conn := agentconnmock.NewMockAgentConn(gomock.NewController(t))
-	_, ok := chattool.InterruptExecute(testutil.Context(t, testutil.WaitShort), conn, newInterruptIdentity(t),
+	_, ok := chattool.InterruptExecute(testutil.Context(t, testutil.WaitShort), nil, conn, newInterruptIdentity(t),
 		parseExecuteArgs(t, `{"command":"make test","timeout":"soon"}`))
 	assert.False(t, ok)
+}
+
+// TestInterruptExecuteNoAnswer covers a cancel request the workspace
+// agent never answers: it ends after the agent answer timeout, and the
+// result is the unknown outcome a start without an answer gets.
+func TestInterruptExecuteNoAnswer(t *testing.T) {
+	t.Parallel()
+
+	ctx := testutil.Context(t, testutil.WaitShort)
+	clock := quartz.NewMock(t)
+	answerTimer := clock.Trap().AfterFunc("chattool", "agent-answer")
+	defer answerTimer.Close()
+	identity := newInterruptIdentity(t)
+	conn := agentconnmock.NewMockAgentConn(gomock.NewController(t))
+	conn.EXPECT().CancelToolCall(gomock.Any(), identity.UUID(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, _ string, _ workspacesdk.CancelToolCallRequest) (workspacesdk.CancelToolCallResponse, error) {
+			<-ctx.Done()
+			return workspacesdk.CancelToolCallResponse{}, &url.Error{Op: http.MethodPost, URL: "http://agent/api/v0/tool-calls", Err: ctx.Err()}
+		})
+
+	type interrupted struct {
+		result chattool.ExecuteResult
+		ok     bool
+	}
+	done := make(chan interrupted, 1)
+	go func() {
+		result, ok := chattool.InterruptExecute(ctx, clock, conn, identity, parseExecuteArgs(t, `{"command":"make test"}`))
+		done <- interrupted{result, ok}
+	}()
+	call := answerTimer.MustWait(ctx)
+	assert.Equal(t, chattool.AgentAnswerTimeout, call.Duration)
+	call.MustRelease(ctx)
+	clock.Advance(chattool.AgentAnswerTimeout).MustWait(ctx)
+
+	got := testutil.RequireReceive(ctx, t, done)
+	require.True(t, got.ok)
+	assert.Contains(t, got.result.Error, "outcome unknown: "+chattool.AgentNoAnswerReason)
+	assert.Contains(t, got.result.Error, "the command may still be running")
+	assert.Contains(t, got.result.Error, identity.UUID())
 }
 
 // TestInterruptExecuteUnreachable covers an interrupted execute call
@@ -412,7 +451,7 @@ func TestInterruptExecuteBeforeStart(t *testing.T) {
 					return workspacesdk.StartProcessResponse{ID: key(ctx), Started: true}, nil
 				})
 
-			result, ok := chattool.InterruptExecute(ctx, conn, identity, parseExecuteArgs(t, input))
+			result, ok := chattool.InterruptExecute(ctx, nil, conn, identity, parseExecuteArgs(t, input))
 			require.True(t, ok)
 			assert.Contains(t, result.Error, "not run: the command was canceled before the workspace agent received it.")
 

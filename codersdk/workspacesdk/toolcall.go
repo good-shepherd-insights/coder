@@ -47,8 +47,10 @@ type ToolCall struct {
 	MessageID int64
 	// ID is the provider tool call ID, raw (unescaped).
 	ID string
-	// Age is the time since the tool call was committed, measured when
-	// the request is sent.
+	// Age is the time since the tool call was committed, measured just
+	// before the request. AgentConn requests add the time spent
+	// connecting to the agent, including waiting for it to become
+	// reachable, before they set CoderToolCallAgeMsHeader.
 	Age time.Duration
 }
 

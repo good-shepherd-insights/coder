@@ -280,7 +280,7 @@ func TestAgentConnToolCallRequests(t *testing.T) {
 	assert.Equal(t, chatID.String(), got.header.Get(workspacesdk.CoderChatIDHeader))
 	assert.Equal(t, []string{"toolu_start"}, got.header.Values(workspacesdk.CoderToolCallIDHeader))
 	assert.Equal(t, "42", got.header.Get(workspacesdk.CoderToolCallMessageIDHeader))
-	assert.Equal(t, "1500", got.header.Get(workspacesdk.CoderToolCallAgeMsHeader))
+	assertAgeAtLeast(t, 1500*time.Millisecond, got.header)
 
 	cancelCall := workspacesdk.ToolCall{MessageID: 43, ID: "toolu/cancel", Age: 20 * time.Millisecond}
 	cancelID := workspacesdk.ToolCallUUID(chatID, cancelCall.MessageID, cancelCall.ID).String()
@@ -294,7 +294,7 @@ func TestAgentConnToolCallRequests(t *testing.T) {
 	assert.JSONEq(t, `{"stop_if_run_age_below_ms":30000}`, string(got.body))
 	assert.Equal(t, []string{"toolu%2Fcancel"}, got.header.Values(workspacesdk.CoderToolCallIDHeader))
 	assert.Equal(t, "43", got.header.Get(workspacesdk.CoderToolCallMessageIDHeader))
-	assert.Equal(t, "20", got.header.Get(workspacesdk.CoderToolCallAgeMsHeader))
+	assertAgeAtLeast(t, 20*time.Millisecond, got.header)
 
 	_, err = conn.CancelToolCall(workspacesdk.WithToolCall(ctx, staleCall), staleID, workspacesdk.CancelToolCallRequest{})
 	var tcErr *workspacesdk.ToolCallError
@@ -425,6 +425,19 @@ func TestAgentConnFileToolCallResults(t *testing.T) {
 			assert.Empty(t, gotSDK.URL())
 			assert.Equal(t, wantErr.Error(), fmt.Sprintf("%s %s: %s", wantSDK.Method(), wantSDK.URL(), gotErr.Error()))
 		})
+	}
+}
+
+// assertAgeAtLeast asserts that h carries the tool call headers with an
+// age of at least sent, the ToolCall.Age the caller set. The SDK adds the
+// time spent connecting, so the header can be larger.
+func assertAgeAtLeast(t *testing.T, sent time.Duration, h http.Header) {
+	t.Helper()
+
+	tc, ok, err := workspacesdk.ToolCallFromHeaders(h)
+	if assert.NoError(t, err) && assert.True(t, ok) {
+		assert.GreaterOrEqual(t, tc.Age, sent)
+		assert.Less(t, tc.Age, sent+testutil.WaitMedium)
 	}
 }
 

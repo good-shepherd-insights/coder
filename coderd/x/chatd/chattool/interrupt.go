@@ -8,6 +8,7 @@ import (
 	"charm.land/fantasy"
 
 	"github.com/coder/coder/v2/codersdk/workspacesdk"
+	"github.com/coder/quartz"
 )
 
 // InterruptedCall is an unresolved tool call that interrupt handling
@@ -63,13 +64,14 @@ func (c InterruptedCall) SameCancel(other InterruptedCall) bool {
 }
 
 // Interrupt cancels the call id on the workspace agent and returns the
-// tool response it gets, built from the agent's answer. ok is false when
-// the call keeps the generic interrupted result.
-func (c InterruptedCall) Interrupt(ctx context.Context, conn workspacesdk.AgentConn, id ToolCallIdentity) (resp fantasy.ToolResponse, ok bool) {
+// tool response it gets, built from the agent's answer. clock times the
+// wait for the answer (nil means a real clock). ok is false when the
+// call keeps the generic interrupted result.
+func (c InterruptedCall) Interrupt(ctx context.Context, clock quartz.Clock, conn workspacesdk.AgentConn, id ToolCallIdentity) (resp fantasy.ToolResponse, ok bool) {
 	if c.toolName != ExecuteToolName {
 		return InterruptFileToolCall(ctx, conn, c.toolName, id)
 	}
-	result, ok := InterruptExecute(ctx, conn, id, c.args)
+	result, ok := InterruptExecute(ctx, clock, conn, id, c.args)
 	return marshalToolResponse(result), ok
 }
 
