@@ -60,7 +60,9 @@ func WithClock(clock quartz.Clock) Option {
 // WithToolCallStore runs the start route through store.Middleware, so a
 // start with tool call headers runs at most once and its process ID is the
 // tool call UUID. The store's records also keep exited tool call
-// processes from being reaped while they are current.
+// processes from being reaped while they are current. The store must use
+// the clock given to WithClock: a tool call process's start time comes
+// from the store's clock and its run age from the API's.
 func WithToolCallStore(store *agenttoolcall.Store) Option {
 	return func(o *apiOptions) {
 		o.toolCallStore = store
