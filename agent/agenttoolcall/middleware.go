@@ -28,6 +28,9 @@ type ToolCall struct {
 	// UUID is workspacesdk.ToolCallUUID of Key, the ID of anything the
 	// tool call creates, such as a process.
 	UUID uuid.UUID
+	// StartedAt is when the store created the tool call's record, the
+	// start of its run age.
+	StartedAt time.Time
 }
 
 type toolCallContextKey struct{}
@@ -73,7 +76,11 @@ func (s *Store) Middleware(next http.Handler) http.Handler {
 			return
 		}
 		if created {
-			tc := ToolCall{Key: key, UUID: workspacesdk.ToolCallUUID(key.ChatID, key.MessageID, key.ToolCallID)}
+			tc := ToolCall{
+				Key:       key,
+				UUID:      workspacesdk.ToolCallUUID(key.ChatID, key.MessageID, key.ToolCallID),
+				StartedAt: rec.createdAt,
+			}
 			rec.run(next, r.WithContext(context.WithValue(ctx, toolCallContextKey{}, tc)))
 		}
 		resp, ok := rec.wait(ctx)

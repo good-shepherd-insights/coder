@@ -104,6 +104,23 @@ func TestCancelHandler(t *testing.T) {
 		assert.Equal(t, http.StatusInternalServerError, w.Code)
 	})
 
+	// The stopper fails because the request context ended while it waited
+	// for the killed process to exit.
+	t.Run("StopperErrorAfterRequestEnded", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t, 0, &countingHandler{})
+		h.requireRun(t, 1, "call", "")
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		stopper := &fakeStopper{err: xerrors.New("wait for process exit: context canceled")}
+
+		w := h.doCancel(ctx, stopper, h.uuid(1, "call"), h.headers(1, "call", 0), `{}`)
+		assert.Len(t, stopper.calls(), 1)
+		assert.Zero(t, w.Body.Len(), "a cancel whose request ended writes nothing")
+		assert.Empty(t, w.Header())
+	})
+
 	t.Run("StaleMessage", func(t *testing.T) {
 		t.Parallel()
 

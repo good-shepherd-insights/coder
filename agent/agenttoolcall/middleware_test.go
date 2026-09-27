@@ -341,12 +341,14 @@ func TestMiddlewareToolCallContext(t *testing.T) {
 		rw.WriteHeader(http.StatusNoContent)
 	})
 	h := newHarness(t, 0, next)
+	createdAt := h.clock.Now()
 
 	w := h.do(t.Context(), http.MethodPost, "/start", "payload", h.headers(1, "call", 0))
 	require.Equal(t, http.StatusNoContent, w.Code)
 	require.True(t, gotOK)
 	assert.Equal(t, h.key(1, "call"), got.Key)
 	assert.Equal(t, workspacesdk.ToolCallUUID(h.chatID, 1, "call"), got.UUID)
+	assert.True(t, createdAt.Equal(got.StartedAt), "run age starts when the record is created")
 	assert.Equal(t, "payload", gotBody, "the handler reads the whole body")
 }
 
