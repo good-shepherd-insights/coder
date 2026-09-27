@@ -5,6 +5,12 @@
 // message, so the agent keeps records only for each chat's latest message
 // ID and refuses older messages; an agent that has run since before a tool
 // call was committed and has no record of it therefore never received it.
+//
+// Run age, the time since the agent first ran a tool call's request, is
+// measured from the record's creation time on the store's clock. The
+// run-age response header, cancel answers, and the process stop rule all
+// use it, so handlers that start work take their start time from
+// ToolCall.StartedAt.
 package agenttoolcall
 
 import (
