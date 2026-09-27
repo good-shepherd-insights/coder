@@ -268,7 +268,8 @@ func TestCancelToolCallProcess(t *testing.T) {
 		require.NotNil(t, resp.Process)
 		assert.False(t, resp.Process.Running)
 		assert.True(t, resp.Process.Canceled)
-		assert.Equal(t, "before\n", resp.Process.Output)
+		// On Windows, sleep can print a Cygwin startup error when its sh is killed.
+		assert.True(t, strings.HasPrefix(resp.Process.Output, "before\n"), "output %q must start with the partial output", resp.Process.Output)
 		require.NotNil(t, resp.Process.ExitCode)
 		assert.NotZero(t, *resp.Process.ExitCode)
 		assert.EqualValues(t, 2000, resp.Process.RunAgeMs)
