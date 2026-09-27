@@ -1,10 +1,12 @@
 package chattool
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -194,7 +196,7 @@ func Execute(options ExecuteOptions) fantasy.AgentTool {
 			if err != nil {
 				// An earlier attempt of this tool call may have started
 				// the command, unless no workspace agent exists to run it.
-				if id, ok := reportableToolCall(ctx); ok && !HasNoWorkspaceAgent(err) {
+				if id, ok := reportableToolCall(ctx); ok && !hasNoWorkspaceAgent(err) {
 					return fantasy.NewTextErrorResponse(UnknownOutcome(AgentUnreachableReason(err),
 						"an earlier attempt may have started the command", checkProcessText(id))), nil
 				}
@@ -328,11 +330,11 @@ func executeForeground(
 	return fantasy.NewTextResponse(string(data))
 }
 
-// HasNoWorkspaceAgent reports whether a workspace connection error means
+// hasNoWorkspaceAgent reports whether a workspace connection error means
 // no workspace agent exists: the chat has no workspace, the workspace was
 // deleted, or it has no running agent. Processes do not outlive the
 // agent, so no earlier attempt's command can still be running.
-func HasNoWorkspaceAgent(err error) bool {
+func hasNoWorkspaceAgent(err error) bool {
 	return errors.Is(err, ErrChatHasNoWorkspace) ||
 		errors.Is(err, ErrWorkspaceDeleted) ||
 		errors.Is(err, ErrWorkspaceHasNoAgent)
@@ -400,8 +402,16 @@ func InterruptExecute(ctx context.Context, conn workspacesdk.AgentConn, id ToolC
 	}
 	proc := resp.Process
 	switch {
+	case proc == nil && resp.StatusCode >= http.StatusBadRequest:
+		return ExecuteResult{Error: recordedStartErrorText(resp, args)}, true
+	case proc == nil && args.RunsInBackground():
+		// The start succeeded, and a background process's ID is the tool
+		// call UUID.
+		return backgroundStartedResult(processID), true
 	case proc == nil:
-		return recordedStartErrorResult(resp, args)
+		words := interruptErrorWords(id, args)
+		return ExecuteResult{Error: UnknownOutcome("the workspace agent reported no process for this tool call",
+			words.Effect, words.Check)}, true
 	case proc.Canceled:
 		exitCode := -1
 		if proc.ExitCode != nil {
@@ -433,7 +443,7 @@ func InterruptExecute(ctx context.Context, conn workspacesdk.AgentConn, id ToolC
 // made. ok is false when the call keeps the caller's generic interrupted
 // result: no workspace agent exists, so no process can be running.
 func InterruptExecuteUnreachable(id ToolCallIdentity, args ExecuteArgs, err error) (result ExecuteResult, ok bool) {
-	if HasNoWorkspaceAgent(err) {
+	if hasNoWorkspaceAgent(err) {
 		return ExecuteResult{}, false
 	}
 	words := interruptErrorWords(id, args)
@@ -448,8 +458,6 @@ func interruptErrorWords(id ToolCallIdentity, args ExecuteArgs) AgentErrorWords 
 		effect = "the command may be running in the background"
 	}
 	return AgentErrorWords{
-		Action:          "cancel process",
-		Existing:        fmt.Sprintf("a process for this tool call (process ID %s)", id.UUID()),
 		Effect:          effect,
 		Check:           checkOrSignalProcessText(id),
 		RestartedEffect: "the command may have run before the restart",
@@ -457,27 +465,24 @@ func interruptErrorWords(id ToolCallIdentity, args ExecuteArgs) AgentErrorWords 
 	}
 }
 
-// recordedStartErrorResult returns the result of an execute call with
-// args whose start request failed, from the agent's recorded answer to
-// it. ok is false when the recorded answer is not an error, which a start
-// that created no process does not produce.
-func recordedStartErrorResult(resp workspacesdk.CancelToolCallResponse, args ExecuteArgs) (result ExecuteResult, ok bool) {
-	if resp.StatusCode < http.StatusBadRequest {
-		return ExecuteResult{}, false
-	}
+// recordedStartErrorText returns the error of an execute call with args
+// from the agent's recorded HTTP error answer to its start request, in
+// the text the start request itself reports for that answer, without
+// the request's method and URL, which the recorded answer lacks.
+func recordedStartErrorText(resp workspacesdk.CancelToolCallResponse, args ExecuteArgs) string {
 	action := "start process"
 	if args.RunsInBackground() {
 		action = "start background process"
 	}
-	msg := http.StatusText(resp.StatusCode)
-	var body codersdk.Response
-	if json.Unmarshal(resp.Body, &body) == nil && body.Message != "" {
-		msg = body.Message
-		if body.Detail != "" {
-			msg += ": " + body.Detail
-		}
+	res := &http.Response{
+		StatusCode: resp.StatusCode,
+		Header:     http.Header{},
+		Body:       io.NopCloser(bytes.NewReader(resp.Body)),
 	}
-	return ExecuteResult{Error: enrichStartError(fmt.Sprintf("%s: %s", action, msg))}, true
+	if resp.ContentType != "" {
+		res.Header.Set("Content-Type", resp.ContentType)
+	}
+	return enrichStartError(fmt.Sprintf("%s: %v", action, codersdk.ReadBodyAsError(res)))
 }
 
 // toolCallProcessOutput converts a tool call's process state to the

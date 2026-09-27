@@ -1027,11 +1027,14 @@ func requireExecuteResult(t *testing.T, part codersdk.ChatMessagePart) chattool.
 	return result
 }
 
-// TestInterruptTask_ExecuteResults commits the chattool result of each
-// kind of cancel answer. It runs without a message part episode, as after
-// an ownership change: the buffer plays no part in the decision. The
-// answer-to-result mapping itself is covered by chattool's
-// TestInterruptExecute.
+// TestInterruptTask_ExecuteResults covers how interrupt handling wires
+// each execute call to chattool: the stop each cancel request carries
+// (the effective timeout in the foreground, 0 in the background), the
+// dial error result, the generic fallback, and a committed mapped answer.
+// It runs without a message part episode, as after an ownership change:
+// the buffer plays no part in the decision. The answer-to-result mapping
+// itself is covered by chattool's TestInterruptExecute and
+// TestInterruptExecuteUnreachable.
 func TestInterruptTask_ExecuteResults(t *testing.T) {
 	t.Parallel()
 
@@ -1066,38 +1069,6 @@ func TestInterruptTask_ExecuteResults(t *testing.T) {
 			wantOutput: "partial",
 		},
 		{
-			name: "ForegroundDefaultTimeout",
-			args: `{"command":"make test"}`,
-			req:  workspacesdk.CancelToolCallRequest{StopIfRunAgeBelowMs: chattool.ExecuteDefaultTimeout.Milliseconds()},
-			resp: workspacesdk.CancelToolCallResponse{Started: true, Process: &workspacesdk.ToolCallProcess{
-				Output: "PASS", ExitCode: intPtr(0), RunAgeMs: 3_000,
-			}},
-			wantOutput: "PASS",
-		},
-		{
-			name: "ForegroundLeftRunning",
-			args: executeForeground,
-			req:  executeForegroundStop,
-			resp: workspacesdk.CancelToolCallResponse{Started: true, Process: &workspacesdk.ToolCallProcess{
-				Running: true, RunAgeMs: (3 * time.Hour).Milliseconds(),
-			}},
-			wantError:      "command timed out after 2h0m0s",
-			wantBackground: true,
-		},
-		{
-			// US10: the agent had not received the start request.
-			name:      "ForegroundNotStarted",
-			args:      executeForeground,
-			req:       executeForegroundStop,
-			wantError: "not run: the command was canceled before the workspace agent received it.",
-		},
-		{
-			// US10: a background call never runs either.
-			name:      "BackgroundNotStarted",
-			args:      executeBackground,
-			wantError: "not run: the command was canceled before the workspace agent received it.",
-		},
-		{
 			name: "BackgroundRunning",
 			args: `{"command":"make dev &"}`,
 			resp: workspacesdk.CancelToolCallResponse{Started: true, Process: &workspacesdk.ToolCallProcess{
@@ -1113,14 +1084,6 @@ func TestInterruptTask_ExecuteResults(t *testing.T) {
 			generic: true,
 		},
 		{
-			name:      "Unreachable",
-			args:      executeForeground,
-			req:       executeForegroundStop,
-			err:       agentTransportError(xerrors.New("connection reset by peer")),
-			wantError: "outcome unknown: the workspace agent could not be reached",
-			wantUUID:  true,
-		},
-		{
 			name:      "NoConnection",
 			args:      executeForeground,
 			dialErr:   xerrors.New("dial failed"),
@@ -1129,38 +1092,9 @@ func TestInterruptTask_ExecuteResults(t *testing.T) {
 			wantUUID:  true,
 		},
 		{
-			name:      "BackgroundNoConnection",
-			args:      executeBackground,
-			dialErr:   xerrors.New("dial failed"),
-			noCancel:  true,
-			wantError: "so the command may be running in the background",
-			wantUUID:  true,
-		},
-		{
 			// No workspace agent exists, so no process can be running.
 			name:     "NoAgent",
 			args:     executeForeground,
-			dialErr:  chattool.ErrWorkspaceHasNoAgent,
-			noCancel: true,
-			generic:  true,
-		},
-		{
-			name:     "DeletedWorkspace",
-			args:     executeForeground,
-			dialErr:  chattool.ErrWorkspaceDeleted,
-			noCancel: true,
-			generic:  true,
-		},
-		{
-			name:     "NoWorkspace",
-			args:     executeForeground,
-			dialErr:  chattool.ErrChatHasNoWorkspace,
-			noCancel: true,
-			generic:  true,
-		},
-		{
-			name:     "BackgroundNoAgent",
-			args:     executeBackground,
 			dialErr:  chattool.ErrWorkspaceHasNoAgent,
 			noCancel: true,
 			generic:  true,
